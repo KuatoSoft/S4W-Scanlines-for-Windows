@@ -1,0 +1,2855 @@
+<Window x:Class="S4W.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="S4W"
+        Background="Transparent"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Topmost="True"
+        ShowActivated="False"
+        ResizeMode="NoResize"
+        SizeToContent="WidthAndHeight"
+        PreviewMouseDown="Window_PreviewMouseDown">
+
+    <!-- WindowChrome: CaptionHeight=0 suppresses system caption; ResizeBorderThickness=0
+         removes the system NC resize frame so nothing draws over the rounded WPF corners.
+         AllowsTransparency=True + Background=Transparent gives clean rounded corners
+         without any DWM square overlay. -->
+    <WindowChrome.WindowChrome>
+        <WindowChrome ResizeBorderThickness="0"
+                      CaptionHeight="0"
+                      GlassFrameThickness="0"
+                      UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
+    <Window.Resources>
+
+        <!-- ===== TOGGLE SWITCH ===== -->
+        <Style x:Key="ToggleSwitchStyle" TargetType="ToggleButton">
+            <Setter Property="Width" Value="44"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Grid Width="44" Height="24">
+                            <Border x:Name="Track" CornerRadius="12" Background="#2A2D38"/>
+                            <Ellipse x:Name="Knob" Width="18" Height="18"
+                                     Fill="#FF2AFF" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Track" Property="Background" Value="#FF2AFF"/>
+                                <Setter TargetName="Knob" Property="Fill" Value="White"/>
+                                <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right"/>
+                                <Setter TargetName="Knob" Property="Margin" Value="0,0,3,0"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== SMALL TOGGLE SWITCH (sub-effects) ===== -->
+        <Style x:Key="SmallToggleSwitchStyle" TargetType="ToggleButton">
+            <Setter Property="Width" Value="32"/>
+            <Setter Property="Height" Value="18"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Grid Width="32" Height="18">
+                            <Border x:Name="Track" CornerRadius="9" Background="#2A2D38"
+                                    BorderBrush="Transparent" BorderThickness="1.5"/>
+                            <Ellipse x:Name="Knob" Width="13" Height="13"
+                                     Fill="#FF2AFF" HorizontalAlignment="Left" Margin="2.5,0,0,0"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Track" Property="Background" Value="Transparent"/>
+                                <Setter TargetName="Track" Property="BorderBrush" Value="#FF2AFF"/>
+                                <Setter TargetName="Knob" Property="Fill" Value="#FF2AFF"/>
+                                <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right"/>
+                                <Setter TargetName="Knob" Property="Margin" Value="0,0,2.5,0"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== SLIDER REPEAT BUTTON ===== -->
+        <Style x:Key="SliderRepeatBtn" TargetType="RepeatButton">
+            <Setter Property="Height" Value="4"/>
+            <Setter Property="IsTabStop" Value="False"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="2"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== SLIDER THUMB ===== -->
+        <Style x:Key="SliderThumbStyle" TargetType="Thumb">
+            <Setter Property="Width" Value="14"/>
+            <Setter Property="Height" Value="14"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Ellipse Fill="#FF2AFF"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== PINK SLIDER ===== -->
+        <Style x:Key="PinkSlider" TargetType="Slider">
+            <Setter Property="Height" Value="20"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid>
+                            <Track x:Name="PART_Track">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="#FF2AFF"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="#2A2D38"/>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Style="{StaticResource SliderThumbStyle}"/>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== GRAY SLIDER ===== -->
+        <Style x:Key="GraySlider" TargetType="Slider" BasedOn="{StaticResource PinkSlider}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid>
+                            <Track x:Name="PART_Track">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="#2A2D38"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="#2A2D38"/>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Style="{StaticResource SliderThumbStyle}">
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="Thumb">
+                                                <Ellipse Fill="#555555"/>
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== CENTER PINK SLIDER (fills from center toward thumb, both directions) ===== -->
+        <Style x:Key="CenterPinkSlider" TargetType="Slider">
+            <Setter Property="Height" Value="20"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid>
+                            <!-- Full gray track background -->
+                            <Border Height="4" Background="#2A2D38" CornerRadius="2"
+                                    VerticalAlignment="Center" Margin="7,0"/>
+                            <!-- Pink fill from center to thumb (updated in code-behind) -->
+                            <Canvas x:Name="PART_FillCanvas" Height="4" VerticalAlignment="Center" Margin="7,0">
+                                <Rectangle x:Name="PART_CenterFill" Height="4" Fill="#FF2AFF"
+                                           RadiusX="2" RadiusY="2" Width="0"/>
+                            </Canvas>
+                            <!-- Center tick marker -->
+                            <Rectangle Width="1" Height="8" Fill="#555555"
+                                       VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                            <!-- Track for thumb hit-testing -->
+                            <Track x:Name="PART_Track">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="Transparent"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource SliderRepeatBtn}" Background="Transparent"/>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Style="{StaticResource SliderThumbStyle}"/>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== DARK TEXTBOX ===== -->
+        <Style x:Key="DarkTextBox" TargetType="TextBox">
+            <Setter Property="Background" Value="#0D1117"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#1E2230"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CaretBrush" Value="White"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6">
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Margin="10,0"
+                                          VerticalAlignment="Center"
+                                          VerticalScrollBarVisibility="Hidden"
+                                          HorizontalScrollBarVisibility="Hidden"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== SMALL INPUT ===== -->
+        <Style x:Key="SmallInput" TargetType="TextBox" BasedOn="{StaticResource DarkTextBox}">
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Padding" Value="4,4"/>
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="TextAlignment" Value="Center"/>
+            <Setter Property="Margin" Value="3,0"/>
+        </Style>
+
+        <!-- ===== DARK BUTTON ===== -->
+        <Style x:Key="DarkButton" TargetType="Button">
+            <Setter Property="Background" Value="#1E2230"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#2A2D38"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="16,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#2A2D38"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== FILLED PINK BUTTON (Save) ===== -->
+        <Style x:Key="FilledPinkButton" TargetType="Button">
+            <Setter Property="Background" Value="#FF2AFF"/>
+            <Setter Property="Foreground" Value="#1A0A1A"/>
+            <Setter Property="BorderBrush" Value="#FF2AFF"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="24,8"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Height" Value="42"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="21" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#E600E6"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#AA00AA"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== APPLY TOGGLE BUTTON (plein rose, toggle état overlay) ===== -->
+        <Style x:Key="ApplyToggleButton" TargetType="Button">
+            <Setter Property="Background" Value="#FF2AFF"/>
+            <Setter Property="Foreground" Value="#1A0A1A"/>
+            <Setter Property="BorderBrush" Value="#FF2AFF"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="24,8"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Height" Value="42"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="21" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#E600E6"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#AA00AA"/>
+                            </Trigger>
+                            <!-- Etat enfoncé/actif via Tag="active" -->
+                            <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="active">
+                                <Setter TargetName="Bd" Property="Background" Value="#AA00AA"/>
+                            </DataTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== COMBOBOX TOGGLE ===== -->
+        <ControlTemplate x:Key="ComboBoxToggleButton" TargetType="ToggleButton">
+            <Border Background="#0D1117" BorderBrush="#1E2230" BorderThickness="1" CornerRadius="6">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition/>
+                        <ColumnDefinition Width="28"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Grid.Column="0"/>
+                    <Path Grid.Column="1" Data="M 0 0 L 5 5 L 10 0"
+                          Stroke="#6B7280" StrokeThickness="1.5"
+                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
+        </ControlTemplate>
+
+        <!-- ===== DARK COMBOBOX ===== -->
+        <Style x:Key="DarkComboBox" TargetType="ComboBox">
+            <Setter Property="Background" Value="#0D1117"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#1E2230"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Padding" Value="10,0"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton x:Name="ToggleButton"
+                                          Template="{StaticResource ComboBoxToggleButton}"
+                                          IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay,
+                                              RelativeSource={RelativeSource TemplatedParent}}"
+                                          Focusable="False"/>
+                            <ContentPresenter x:Name="ContentSite"
+                                              Margin="10,0,30,0"
+                                              VerticalAlignment="Center"
+                                              HorizontalAlignment="Left"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              IsHitTestVisible="False"/>
+                            <TextBox x:Name="PART_EditableTextBox"
+                                     Margin="10,0,30,0"
+                                     VerticalAlignment="Center"
+                                     HorizontalAlignment="Stretch"
+                                     Foreground="White"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     CaretBrush="White"
+                                     Focusable="True"
+                                     Visibility="Collapsed"
+                                     IsReadOnly="{TemplateBinding IsReadOnly}"/>
+                            <Popup x:Name="Popup" Placement="Bottom"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   AllowsTransparency="True" Focusable="False"
+                                   PopupAnimation="Slide">
+                                <Grid MinWidth="{TemplateBinding ActualWidth}" MaxHeight="200">
+                                    <Border Background="#151921" BorderBrush="#1E2230"
+                                            BorderThickness="1" CornerRadius="6">
+                                        <ScrollViewer SnapsToDevicePixels="True">
+                                            <StackPanel IsItemsHost="True"/>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Grid>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEditable" Value="True">
+                                <Setter TargetName="ContentSite" Property="Visibility" Value="Collapsed"/>
+                                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Resources>
+                <Style TargetType="ComboBoxItem">
+                    <Setter Property="Foreground" Value="White"/>
+                    <Setter Property="Background" Value="Transparent"/>
+                    <Setter Property="Padding" Value="10,6"/>
+                    <Style.Triggers>
+                        <Trigger Property="IsHighlighted" Value="True">
+                            <Setter Property="Background" Value="#1E2230"/>
+                        </Trigger>
+                    </Style.Triggers>
+                </Style>
+            </Style.Resources>
+        </Style>
+
+        <!-- ===== MONITOR BUTTON ===== -->
+        <Style x:Key="MonitorButton" TargetType="RadioButton">
+            <Setter Property="Width" Value="80"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="Foreground" Value="#6B7280"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="GroupName" Value="Monitor"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Bd" CornerRadius="6"
+                                Background="Transparent"
+                                BorderBrush="#2A2D38" BorderThickness="1.5">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#FF2AFF"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#FF2AFF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#1A1D28"/>
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.18"/>
+                                <Setter Property="Foreground" Value="#3A3D48"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== HOTKEY BUTTON ===== -->
+        <Style x:Key="HotkeyButton" TargetType="Button">
+            <Setter Property="Background" Value="#1E2230"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#2A2D38"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="MinWidth" Value="90"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="16" Padding="14,0">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#2A2D38"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== TAB HOVER STYLE ===== -->
+        <Style x:Key="TabBorderStyle" TargetType="Border">
+            <Setter Property="Background" Value="Transparent"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#12FF2AFF"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- ===== SCALE RADIO BUTTON ===== -->
+        <Style x:Key="ScaleBtn" TargetType="RadioButton">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Bd" Background="#1E2230" CornerRadius="6"
+                                BorderBrush="#2D3748" BorderThickness="1" Padding="0,8">
+                            <TextBlock x:Name="Lbl" Text="{TemplateBinding Content}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Foreground="#6B7280" FontSize="12" FontWeight="SemiBold"
+                                       FontFamily="Segoe UI"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#2D1340"/>
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#FF2AFF"/>
+                                <Setter TargetName="Lbl" Property="Foreground" Value="#FF2AFF"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#252B3B"/>
+                                <Setter TargetName="Lbl" Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Background" Value="#0D0F18"/>
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#141720"/>
+                                <Setter TargetName="Lbl" Property="Foreground" Value="#1E2230"/>
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== SPINNER BUTTON (▲/▼ next to numeric inputs) ===== -->
+        <Style x:Key="SpinBtn" TargetType="RepeatButton">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="#4B5563"/>
+            <Setter Property="FontSize" Value="7"/>
+            <Setter Property="Height" Value="13"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Delay" Value="400"/>
+            <Setter Property="Interval" Value="80"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="2">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#2A2D38"/>
+                                <Setter Property="Foreground" Value="#FF2AFF"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#1A1D28"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#2A2D38"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== CRT COLLAPSE BUTTON (chevron path, pink on hover) ===== -->
+        <Style x:Key="CrtCollapseBtn" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Grid>
+                            <!-- Invisible rectangle fills the full 40×40 hit area -->
+                            <Rectangle Fill="Transparent"/>
+                            <Path x:Name="Arrow"
+                                  Data="M 0 0 L 7 7 L 14 0"
+                                  Stroke="#6B7280" StrokeThickness="2"
+                                  StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                  Width="14" Height="7" Stretch="Fill"
+                                  HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <DataTrigger Binding="{Binding Content, RelativeSource={RelativeSource TemplatedParent}}" Value="▲">
+                                <Setter TargetName="Arrow" Property="Data" Value="M 0 7 L 7 0 L 14 7"/>
+                            </DataTrigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Arrow" Property="Stroke" Value="#FF2AFF"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+    </Window.Resources>
+
+    <!-- ═══════════ OUTER FRAME ═══════════ -->
+    <Border Background="#080A10" CornerRadius="12"
+            BorderBrush="#1A1D28" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- ═══════ HEADER ═══════ -->
+            <Border Grid.Row="0" Background="#0C0E16" CornerRadius="12,12,0,0"
+                    Padding="18,12,12,10" MouseLeftButtonDown="Header_MouseLeftButtonDown">
+                <Grid>
+                    <!-- Logo vectoriel v2 — converti depuis SVG viewBox="0 0 358.14 128.46" -->
+                    <!-- Logo v1 (ancien) conservé en commentaire :
+                    <Viewbox Height="46" VerticalAlignment="Center" HorizontalAlignment="Left">
+                        <Canvas Width="315.17" Height="91.55"> ... </Canvas>
+                    </Viewbox>
+                    -->
+                    <Viewbox Height="50" VerticalAlignment="Center" HorizontalAlignment="Left">
+                        <Canvas Width="358.14" Height="128.46">
+                            <!-- Icône gauche (blanc) -->
+                            <Path Fill="#FDFDFD" Data="M15.27,71.45c-3.43-1.75-6.86-3.5-9.44-4.83v-18.47l42.46,11.16,42.46-11.16v18.47c-2.58,1.32-6.01,3.08-9.45,4.83-4.9,2.51-9.81,5.01-12.22,6.24l-20.79-11.61-20.79,11.61c-2.42-1.23-7.32-3.73-12.23-6.25Z"/>
+                            <Path Fill="#FDFDFD" Data="M96.57,31.03h0s0,3.55,0,3.55l-48.29,12.69L0,34.58v-3.55h0s0-11.08,0-11.08h0C12.26,7.19,29.18-.01,46.87,0h1.42S49.71,0,49.71,0c17.69-.01,34.62,7.19,46.87,19.95h0s0,11.08,0,11.08Z"/>
+                            <Path Fill="#FDFDFD" Data="M96.58,76.74v24.85s-12.87,10.2-22.79,18.03c-7.26,5.73-16.25,8.85-25.5,8.84,0,0,0,0,0,0,0,0,0,0,0,0-9.25,0-18.24-3.11-25.5-8.84C12.87,111.79,0,101.61,0,101.59v-24.85c.16.08.32.16.49.25,2.59,1.32,6.04,3.09,9.48,4.84,6.89,3.52,13.79,7.04,13.79,7.05l3.99,2.02,20.53-11.47,20.53,11.47,4-2.03s6.89-3.52,13.78-7.03c3.45-1.76,6.9-3.52,9.49-4.84.17-.09.34-.17.5-.26Z"/>
+                            <!-- Icône gauche (rose) -->
+                            <Path Fill="#FF2AFF" Data="M48.29,59.31L5.83,48.16v18.47c2.59,1.32,6.01,3.08,9.44,4.83,4.91,2.51,9.81,5.02,12.23,6.25l20.79-11.61,20.79,11.61c2.41-1.23,7.32-3.73,12.22-6.24,3.44-1.75,6.87-3.51,9.45-4.83v-18.47l-42.46,11.16Z"/>
+                            <!-- S4W grand texte -->
+                            <Path Fill="White" Data="M182.53,64.78c0-1.37-.6-2.48-1.81-3.33-1.21-.85-3.18-1.47-5.92-1.85l-10.53-1.56c-8.12-1.26-14.03-3.37-17.73-6.34-3.7-2.96-5.55-7.02-5.55-12.18,0-5.71,2.59-10.15,7.78-13.33,5.18-3.18,12.33-4.77,21.44-4.77,16.84,0,26.28,5.9,28.31,17.69l-16.87,1.65c-.88-2.41-2.25-4.16-4.12-5.23s-4.5-1.6-7.9-1.6c-3.62,0-6.41.44-8.35,1.32-1.95.88-2.92,2.14-2.92,3.79,0,1.37.52,2.42,1.56,3.13,1.04.71,2.96,1.29,5.76,1.73l12.84,2.06c7.62,1.21,13.14,3.25,16.54,6.13,3.4,2.88,5.1,6.93,5.1,12.14,0,6.25-2.52,10.97-7.57,14.15-5.05,3.18-12.48,4.77-22.3,4.77-19.31,0-29.6-6.86-30.86-20.57h17.45c1.04,5.38,5.54,8.06,13.5,8.06s12.18-1.95,12.18-5.84Z"/>
+                            <Path Fill="White" Data="M237,71.03h-31.27v-12.34l30.2-33.9h16.46v34.48h8.23l-1.48,11.77h-6.75v10.62h-15.39v-10.62ZM237,41.08l-16.21,18.19h16.21v-18.19Z"/>
+                            <Path Fill="White" Data="M339.62,22.89h18.52l-19.01,58.76h-18.85l-10.86-36.29-10.95,36.29h-18.6l-19.01-58.76h19.01l10.29,39.25,11.44-38.84h16.21l11.52,39.01,10.29-39.42Z"/>
+                            <!-- Tagline bas -->
+                            <Path Fill="White" Data="M140.13,102.83c0-2.88,2.18-5.48,5.44-5.48,1.19,0,2.28.46,2.87.9l-.25,1.56c-.79-.7-1.7-1.16-2.71-1.16-2.34,0-3.89,1.95-3.89,4.19,0,1.72.94,2.92,2.7,2.92,1.29,0,2.32-.58,3.17-1.24l-.27,1.69c-.68.43-1.68.85-2.96.85-2.41,0-4.09-1.76-4.09-4.22Z"/>
+                            <Path Fill="White" Data="M155.18,103.22l2.63,3.64h-1.68l-2.44-3.54h-.78l-.56,3.54h-1.42l1.49-9.35h2.46c1.98,0,3.13,1.09,3.13,2.69,0,1.46-1.14,2.67-2.84,3.02ZM153.63,98.78l-.52,3.3h1.17c1.52,0,2.29-.86,2.29-1.84,0-.85-.52-1.46-1.76-1.46h-1.18Z"/>
+                            <Path Fill="White" Data="M162.38,106.87l1.28-8.05h-2.69l.2-1.31h6.82l-.22,1.31h-2.7l-1.27,8.05h-1.43Z"/>
+                            <Path Fill="White" Data="M175.49,106.19l.24-1.46c.75.58,1.7,1.04,2.69,1.04,1.14,0,1.81-.64,1.81-1.42,0-.89-.64-1.24-1.66-1.77-.99-.51-2.01-1.19-2.01-2.65,0-1.63,1.37-2.61,3.18-2.61,1.24,0,2.11.45,2.67.69l-.24,1.48c-.67-.47-1.52-.87-2.45-.87-1.07,0-1.68.51-1.68,1.25s.6,1.12,1.58,1.62c1.04.52,2.11,1.23,2.11,2.77s-1.33,2.8-3.3,2.8c-1.21,0-2.25-.48-2.93-.88Z"/>
+                            <Path Fill="White" Data="M184.92,106.87l1.49-9.35h1.42l-1.49,9.35h-1.42Z"/>
+                            <Path Fill="White" Data="M189.96,106.87l3.07-9.59,2.5,7.03,4.71-7.03.04,9.59h-1.41v-5.44s-3.76,5.65-3.76,5.65l-1.99-5.64-1.73,5.43h-1.44Z"/>
+                            <Path Fill="White" Data="M204.18,103.99c0-.42.03-.83.1-1.26l.83-5.22h1.45l-.83,5.22c-.07.46-.1.86-.1,1.24,0,1.02.67,1.82,1.87,1.82,1.27,0,2.4-.78,2.7-2.69l.89-5.58h1.41l-.89,5.6c-.42,2.7-2.12,4-4.21,4-1.98,0-3.22-1.34-3.22-3.11Z"/>
+                            <Path Fill="White" Data="M214.97,106.87l1.49-9.35h1.42l-1.28,8.05h3.79l-.2,1.31h-5.21Z"/>
+                            <Path Fill="White" Data="M230.59,106.87l-.51-1.71h-4.39l-1.06,1.71h-1.65l6.07-9.57,3.04,9.57h-1.51ZM226.46,103.88h3.24l-1.06-3.55-2.18,3.55Z"/>
+                            <Path Fill="White" Data="M235.82,106.87l1.28-8.05h-2.69l.2-1.31h6.82l-.22,1.31h-2.7l-1.27,8.05h-1.43Z"/>
+                            <Path Fill="White" Data="M243.29,106.87l1.49-9.35h1.42l-1.49,9.35h-1.42Z"/>
+                            <Path Fill="White" Data="M249.09,102.83c0-2.88,2.35-5.51,5.28-5.51,2.37,0,4.12,1.78,4.12,4.24,0,2.89-2.36,5.52-5.29,5.52-2.36,0-4.11-1.78-4.11-4.25ZM257.04,101.55c0-1.76-1.04-2.93-2.72-2.93-2.11,0-3.77,1.96-3.77,4.2,0,1.77,1.04,2.94,2.72,2.94,2.1,0,3.77-1.96,3.77-4.21Z"/>
+                            <Path Fill="White" Data="M269.15,107.1l-5.43-6.64c-.12.93-.26,1.94-.42,2.88l-.56,3.52h-1.4l1.51-9.55,5.45,6.62c.12-.94.25-1.87.41-2.88l.56-3.54h1.4l-1.52,9.59Z"/>
+                            <Path Fill="White" Data="M279.22,106.87l1.49-9.35h5.7l-.2,1.29h-4.28l-.42,2.66h3.55l-.19,1.27h-3.56l-.45,2.84h4.45l-.2,1.29h-5.87Z"/>
+                            <Path Fill="White" Data="M296.35,107.1l-5.43-6.64c-.12.93-.26,1.94-.42,2.88l-.56,3.52h-1.4l1.51-9.55,5.45,6.62c.12-.94.25-1.87.41-2.88l.56-3.54h1.4l-1.52,9.59Z"/>
+                            <Path Fill="White" Data="M300.77,102.83c0-2.28,1.66-5.48,5.47-5.48,1.32,0,2.45.48,3.17.98l-.25,1.56c-.89-.71-1.92-1.24-3.02-1.24-2.84,0-3.92,2.58-3.92,4.19s.94,2.92,2.77,2.92c.87,0,1.53-.25,2.1-.57l.3-1.78h-1.99l.19-1.24h3.41l-.61,3.8c-.62.42-1.84,1.09-3.47,1.09-2.57,0-4.14-1.85-4.14-4.22Z"/>
+                            <Path Fill="White" Data="M312.17,106.87l1.49-9.35h1.42l-1.49,9.35h-1.42Z"/>
+                            <Path Fill="White" Data="M325.45,107.1l-5.43-6.64c-.12.93-.26,1.94-.42,2.88l-.56,3.52h-1.4l1.51-9.55,5.45,6.62c.12-.94.25-1.87.41-2.88l.56-3.54h1.4l-1.52,9.59Z"/>
+                            <Path Fill="White" Data="M329.55,106.87l1.49-9.35h5.7l-.2,1.29h-4.28l-.42,2.66h3.55l-.19,1.27h-3.56l-.45,2.84h4.45l-.2,1.29h-5.87Z"/>
+                        </Canvas>
+                    </Viewbox>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                                VerticalAlignment="Top">
+                        <Button x:Name="BtnMinimize" Width="30" Height="30"
+        Background="Transparent" BorderBrush="Transparent"
+        FontSize="11" Cursor="Hand" Click="BtnMinimize_Click" Margin="0,0,2,0">
+    <Button.Template>
+        <ControlTemplate TargetType="Button">
+            <Border Background="Transparent" CornerRadius="6">
+                <TextBlock x:Name="Ico" Text="──" Foreground="#6B7280"
+                           FontSize="14" HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Ico" Property="Foreground" Value="#FF2AFF"/>
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+    </Button.Template>
+</Button>
+<Button x:Name="BtnClose" Width="30" Height="30"
+        Background="Transparent" BorderBrush="Transparent"
+        FontSize="11" Cursor="Hand" Click="BtnClose_Click">
+    <Button.Template>
+        <ControlTemplate TargetType="Button">
+            <Border Background="Transparent" CornerRadius="6">
+                <TextBlock x:Name="Ico" Text="&#x2715;" Foreground="#6B7280"
+                           FontSize="14" HorizontalAlignment="Center"
+                           VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Ico" Property="Foreground" Value="#FF2AFF"/>
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+    </Button.Template>
+</Button>
+    </StackPanel>
+</Grid>
+</Border>
+
+
+            <!-- ═══════ TAB BAR ═══════ -->
+            <Border Grid.Row="1" Background="#080A10" Padding="16,0,16,0"
+                    BorderBrush="#1A1D28" BorderThickness="0,0,0,1">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Tab 1 -->
+                    <Border Grid.Column="0" Cursor="Hand"
+                            MouseLeftButtonDown="TabBtn1_Click" Padding="0,10,0,8"
+                            Style="{StaticResource TabBorderStyle}">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,8">
+                                <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets"
+                                           FontSize="13" VerticalAlignment="Center" Margin="0,0,8,0"
+                                           x:Name="TabBtn1Icon" Foreground="White"/>
+                                <TextBlock x:Name="TabBtn1Text" Text="LAYER CONFIGURATION"
+                                           Foreground="White" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center"/>
+                            </StackPanel>
+                            <Border x:Name="TabBtn1Indicator" Height="2" Background="#FF2AFF"
+                                    CornerRadius="1"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Tab 2 — CRT EFFECTS -->
+                    <Border Grid.Column="1" Cursor="Hand"
+                            MouseLeftButtonDown="TabBtn2_Click" Padding="0,10,0,8"
+                            Style="{StaticResource TabBorderStyle}">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,8">
+                                <TextBlock Text="&#xE7F4;" FontFamily="Segoe MDL2 Assets"
+                                           FontSize="13" VerticalAlignment="Center" Margin="0,0,8,0"
+                                           x:Name="TabBtn2Icon" Foreground="#6B7280"/>
+                                <TextBlock x:Name="TabBtn2Text" Text="CRT EFFECTS"
+                                           Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center"/>
+                            </StackPanel>
+                            <Border x:Name="TabBtn2Indicator" Height="2" Background="#FF2AFF"
+                                    CornerRadius="1" Visibility="Collapsed"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Tab 3 — SYSTEM SETTINGS -->
+                    <Border Grid.Column="2" Cursor="Hand"
+                            MouseLeftButtonDown="TabBtn3_Click" Padding="0,10,0,8"
+                            Style="{StaticResource TabBorderStyle}">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,8">
+                                <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets"
+                                           FontSize="13" VerticalAlignment="Center" Margin="0,0,8,0"
+                                           x:Name="TabBtn3Icon" Foreground="#6B7280"/>
+                                <TextBlock x:Name="TabBtn3Text" Text="SYSTEM SETTINGS"
+                                           Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center"/>
+                            </StackPanel>
+                            <Border x:Name="TabBtn3Indicator" Height="2" Background="#FF2AFF"
+                                    CornerRadius="1" Visibility="Collapsed"/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- ══════════════════════════════════════ -->
+            <!--     TAB 1 — LAYER CONFIGURATION       -->
+            <!-- ══════════════════════════════════════ -->
+            <ScrollViewer Grid.Row="2" x:Name="Tab1Content"
+                          VerticalScrollBarVisibility="Hidden"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="18,14,18,8">
+
+                    <!-- ── BEZEL ── -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE753;" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LblBezelSectionHeader" Text="BEZEL"
+                                   Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+                        <Border x:Name="InfoBezel" Width="15" Height="15" CornerRadius="8"
+                                BorderThickness="1" Background="Transparent"
+                                Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                                IsEnabled="True"
+                                ToolTipService.InitialShowDelay="0"
+                                ToolTipService.ShowOnDisabled="True">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="BorderBrush" Value="#4B5563"/>
+                                    <Style.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                        </Trigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                                       FontFamily="Segoe UI" FontStyle="Italic"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="#6B7280"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                                <Setter Property="Foreground" Value="#FF2AFF"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Border>
+                    </StackPanel>
+
+                    <Border Background="#151921" CornerRadius="10"
+                            BorderBrush="#1A1D28" BorderThickness="1"
+                            Padding="16,16" Margin="0,0,0,16">
+                        <StackPanel>
+                            <!-- FILE PATH header + enable toggle -->
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <ToggleButton Grid.Column="0" x:Name="ToggleBezelEnabled"
+                                              Style="{StaticResource ToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Margin="0,0,8,0"
+                                              Checked="ToggleBezelEnabled_Changed"
+                                              Unchecked="ToggleBezelEnabled_Changed"/>
+                                <TextBlock Grid.Column="1" x:Name="LblFilePath" Text="FILE PATH"
+                                           Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
+                                           FontFamily="Segoe UI" VerticalAlignment="Center"/>
+                            </Grid>
+                            <!-- Bezel controls — grayed out when toggle is off -->
+                            <StackPanel x:Name="BezelContentPanel" IsEnabled="False" Opacity="0.35">
+                                <Grid Margin="0,0,0,12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox Grid.Column="0" x:Name="TxtBezelPath" Text="None"
+                                             Style="{StaticResource DarkTextBox}" Margin="0,0,8,0"/>
+                                    <!-- Prev bezel -->
+                                    <Button Grid.Column="1" x:Name="BtnBezelPrev" Content="◀"
+                                            Width="28" Height="34" Padding="0"
+                                            Click="BtnBezelPrev_Click">
+                                        <Button.Style>
+                                            <Style TargetType="Button">
+                                                <Setter Property="Background" Value="#1E2230"/>
+                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="Button">
+                                                            <Border Background="{TemplateBinding Background}"
+                                                                    BorderBrush="#2A2D38" BorderThickness="1"
+                                                                    CornerRadius="6,0,0,6">
+                                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter Property="Background" Value="#2A2D38"/>
+                                                                    <Setter Property="Foreground" Value="White"/>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </Button.Style>
+                                    </Button>
+                                    <!-- Next bezel -->
+                                    <Button Grid.Column="2" x:Name="BtnBezelNext" Content="▶"
+                                            Width="28" Height="34" Padding="0" Margin="0,0,8,0"
+                                            Click="BtnBezelNext_Click">
+                                        <Button.Style>
+                                            <Style TargetType="Button">
+                                                <Setter Property="Background" Value="#1E2230"/>
+                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="Button">
+                                                            <Border Background="{TemplateBinding Background}"
+                                                                    BorderBrush="#2A2D38" BorderThickness="1"
+                                                                    CornerRadius="0,6,6,0">
+                                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter Property="Background" Value="#2A2D38"/>
+                                                                    <Setter Property="Foreground" Value="White"/>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </Button.Style>
+                                    </Button>
+                                    <Button Grid.Column="3" x:Name="BtnBezelSearchBtn" Content="Set"
+                                            Style="{StaticResource DarkButton}" Click="BtnBezelSearch_Click"
+                                            Margin="0,0,8,0"/>
+                                    <Button Grid.Column="4" x:Name="BtnBezelResetBtn" Content="Reset"
+                                            Style="{StaticResource DarkButton}" Click="BtnBezelReset_Click"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblBezelOpacity" Text="OPACITY"
+                                               Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
+                                               FontFamily="Segoe UI"/>
+                                    <TextBlock Grid.Column="1" x:Name="TxtBezelOpacityPct"
+                                               Text="{Binding Value, ElementName=SliderBezelOpacity, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="12" FontWeight="SemiBold"/>
+                                </Grid>
+                                <Slider x:Name="SliderBezelOpacity"
+                                        Style="{StaticResource PinkSlider}"
+                                        Minimum="0" Maximum="100" Value="0"
+                                        Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                        AutoToolTipPlacement="TopLeft"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- ── SCANLINES GENERATOR ── -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE8EF;" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LblScanlinesSectionHeader" Text="SCANLINES GENERATOR"
+                                   Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+                    </StackPanel>
+
+                    <Grid Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Horizontal Card -->
+                        <Border Grid.Column="0" x:Name="HorizontalSection" Background="#151921" CornerRadius="10"
+                                BorderBrush="#1A1D28" BorderThickness="1" Padding="12,14">
+
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <ToggleButton x:Name="ToggleHorizontal"
+                                                  Style="{StaticResource ToggleSwitchStyle}"
+                                                  IsChecked="True"
+                                                  Checked="ToggleHorizontal_Changed"
+                                                  Unchecked="ToggleHorizontal_Changed"/>
+                                    <TextBlock x:Name="LblHorizontal" Text="HORIZONTAL"
+                                               Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </StackPanel>
+                                <Grid Margin="0,0,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" x:Name="LblHGap" Text="GAP"
+                                               Foreground="#6B7280" FontSize="9" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblHThickness" Text="THICKNESS"
+                                               Foreground="#6B7280" FontSize="9" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <!-- GAP -->
+                                    <Grid Grid.Column="0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="13"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Grid.Column="0" x:Name="TxtHGap" Text="0 px" Style="{StaticResource SmallInput}"/>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <RepeatButton Content="▲" Style="{StaticResource SpinBtn}" Click="SpinUp_Click"/>
+                                            <RepeatButton Content="▼" Style="{StaticResource SpinBtn}" Click="SpinDown_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <!-- THICKNESS -->
+                                    <Grid Grid.Column="1">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="13"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Grid.Column="0" x:Name="TxtHThickness" Text="0 px" Style="{StaticResource SmallInput}"/>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <RepeatButton Content="▲" Style="{StaticResource SpinBtn}" Click="SpinUp_Click"/>
+                                            <RepeatButton Content="▼" Style="{StaticResource SpinBtn}" Click="SpinDown_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Grid>
+                                <Grid Margin="0,0,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblHOpacity" Text="OPACITY"
+                                               Foreground="#6B7280" FontSize="9" FontWeight="SemiBold"/>
+                                    <TextBlock Grid.Column="1" x:Name="TxtHOpacityPct"
+                                               Text="{Binding Value, ElementName=SliderHOpacity, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"/>
+                                </Grid>
+                                <Slider x:Name="SliderHOpacity"
+                                        Style="{StaticResource PinkSlider}" Minimum="0" Maximum="100" Value="0"
+                                        Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                        AutoToolTipPlacement="TopLeft"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Vertical Card -->
+                        <Border Grid.Column="2" x:Name="VerticalSection" Background="#151921" CornerRadius="10"
+                                BorderBrush="#1A1D28" BorderThickness="1" Padding="12,14">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <ToggleButton x:Name="ToggleVertical"
+                                                  Style="{StaticResource ToggleSwitchStyle}"
+                                                  IsChecked="False"
+                                                  Checked="ToggleVertical_Changed"
+                                                  Unchecked="ToggleVertical_Changed"/>
+                                    <TextBlock x:Name="LblVertical" Text="VERTICAL"
+                                               Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </StackPanel>
+                                <Grid Margin="0,0,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" x:Name="LblVGap" Text="GAP"
+                                               Foreground="#555555" FontSize="9" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblVThickness" Text="THICKNESS"
+                                               Foreground="#555555" FontSize="9" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <!-- GAP -->
+                                    <Grid Grid.Column="0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="13"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Grid.Column="0" x:Name="TxtVGap" Text="0 px" Style="{StaticResource SmallInput}" IsEnabled="False" Opacity="0.4"/>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center"
+                                                    IsEnabled="{Binding IsEnabled, ElementName=TxtVGap}">
+                                            <RepeatButton Content="▲" Style="{StaticResource SpinBtn}" Click="SpinUp_Click"/>
+                                            <RepeatButton Content="▼" Style="{StaticResource SpinBtn}" Click="SpinDown_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <!-- THICKNESS -->
+                                    <Grid Grid.Column="1">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="13"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Grid.Column="0" x:Name="TxtVThickness" Text="0 px" Style="{StaticResource SmallInput}" IsEnabled="False" Opacity="0.4"/>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center"
+                                                    IsEnabled="{Binding IsEnabled, ElementName=TxtVThickness}">
+                                            <RepeatButton Content="▲" Style="{StaticResource SpinBtn}" Click="SpinUp_Click"/>
+                                            <RepeatButton Content="▼" Style="{StaticResource SpinBtn}" Click="SpinDown_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Grid>
+                                <Grid Margin="0,0,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblVOpacity" Text="OPACITY"
+                                               Foreground="#555555" FontSize="9" FontWeight="SemiBold"/>
+                                    <TextBlock Grid.Column="1" x:Name="TxtVOpacityPct"
+                                               Text="{Binding Value, ElementName=SliderVOpacity, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"/>
+                                </Grid>
+                                <Slider x:Name="SliderVOpacity"
+                                        Style="{StaticResource GraySlider}"
+                                        Minimum="0" Maximum="100" Value="0" IsEnabled="False"
+                                        Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                        AutoToolTipPlacement="TopLeft"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+
+                    <!-- ── ASSOCIATION PROFILE ── -->
+<StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+    <TextBlock Text="&#xE71B;" FontFamily="Segoe MDL2 Assets" FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+    <TextBlock x:Name="LblAutomationSectionHeader" Text="ASSOCIATION PROFILE" Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"
+               VerticalAlignment="Center"/>
+    <!-- Info icon -->
+    <Border x:Name="InfoAssocProfile" Width="15" Height="15" CornerRadius="8"
+            BorderThickness="1"
+            Background="Transparent"
+            Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+            IsEnabled="True"
+            ToolTipService.InitialShowDelay="0"
+            ToolTipService.ShowOnDisabled="True">
+        <Border.Style>
+            <Style TargetType="Border">
+                <Setter Property="BorderBrush" Value="#4B5563"/>
+                <Style.Triggers>
+                    <Trigger Property="IsMouseOver" Value="True">
+                        <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                    </Trigger>
+                </Style.Triggers>
+            </Style>
+        </Border.Style>
+        <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                   FontFamily="Segoe UI" FontStyle="Italic"
+                   HorizontalAlignment="Center" VerticalAlignment="Center">
+            <TextBlock.Style>
+                <Style TargetType="TextBlock">
+                    <Setter Property="Foreground" Value="#6B7280"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                            <Setter Property="Foreground" Value="#FF2AFF"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </TextBlock.Style>
+        </TextBlock>
+    </Border>
+</StackPanel>
+
+<Border Background="#151921" CornerRadius="10" BorderBrush="#1A1D28" BorderThickness="1" Padding="16,14" Margin="0,0,0,8">
+    <!-- Associated Profile -->
+    <StackPanel>
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+            <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <TextBlock x:Name="LblAssociatedProfile" Text="ASSOCIATED PROFILE" Foreground="#6B7280" FontSize="10" FontWeight="SemiBold" FontFamily="Segoe UI"/>
+        </StackPanel>
+        <Grid Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <ComboBox Grid.Column="0" x:Name="CmbProfile" Style="{StaticResource DarkComboBox}" IsEditable="True" MaxDropDownHeight="450" SelectionChanged="CmbProfile_SelectionChanged">
+                <ComboBoxItem Content="Desktop" IsSelected="True"/>
+            </ComboBox>
+            <!-- Prev profile -->
+            <Button Grid.Column="1" x:Name="BtnProfilePrev" Content="◀"
+                    Width="28" Height="34" Padding="0"
+                    Click="BtnProfilePrev_Click">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Background" Value="#1E2230"/>
+                        <Setter Property="Foreground" Value="#6B7280"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}"
+                                            BorderBrush="#2A2D38" BorderThickness="1"
+                                            CornerRadius="6,0,0,6">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter Property="Background" Value="#2A2D38"/>
+                                            <Setter Property="Foreground" Value="White"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </Button.Style>
+            </Button>
+            <!-- Next profile -->
+            <Button Grid.Column="2" x:Name="BtnProfileNext" Content="▶"
+                    Width="28" Height="34" Padding="0" Margin="0,0,8,0"
+                    Click="BtnProfileNext_Click">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Background" Value="#1E2230"/>
+                        <Setter Property="Foreground" Value="#6B7280"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}"
+                                            BorderBrush="#2A2D38" BorderThickness="1"
+                                            CornerRadius="0,6,6,0">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter Property="Background" Value="#2A2D38"/>
+                                            <Setter Property="Foreground" Value="White"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </Button.Style>
+            </Button>
+            <Button Grid.Column="3" x:Name="BtnResetProfileBtn" Content="Reset" Style="{StaticResource DarkButton}" Click="BtnResetProfile_Click" Margin="0,0,8,0"/>
+            <Button Grid.Column="4" x:Name="BtnDeleteProfileBtn" Style="{StaticResource DarkButton}"
+                    Click="BtnDeleteProfile_Click" Padding="10,6"/>
+        </Grid>
+        
+        <!-- Application/Emulator Path (hidden for Desktop profile) -->
+        <StackPanel x:Name="AppPathSection">
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="&#xE71B;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="LblAppPath" Text="APPLICATION/EMULATOR PATH" Foreground="#6B7280" FontSize="10" FontWeight="SemiBold" FontFamily="Segoe UI"/>
+            </StackPanel>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <ComboBox Grid.Column="0" x:Name="CmbAppPath" Style="{StaticResource DarkComboBox}" Margin="0,0,6,0"/>
+                <Button Grid.Column="1" x:Name="BtnAppSearchBtn" Content="Set Path" Style="{StaticResource DarkButton}" Click="BtnAppSearch_Click" Margin="0,0,4,0"/>
+                <Button Grid.Column="2" x:Name="BtnPickProcessBtn" Content="Set Process" Style="{StaticResource DarkButton}" Click="BtnPickProcess_Click" Margin="0,0,4,0"/>
+                <Button Grid.Column="3" x:Name="BtnAppDeleteBtn" Style="{StaticResource DarkButton}"
+                        Click="BtnAppDelete_Click" Padding="10,6"/>
+            </Grid>
+        </StackPanel>
+        <!-- Running processes picker (hidden by default) -->
+        <Border x:Name="ProcessPickerPanel" Visibility="Collapsed"
+                Background="#0D1117" CornerRadius="6" BorderBrush="#2A2D38" BorderThickness="1"
+                Padding="0" MaxHeight="220">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <!-- Header -->
+                <Grid Grid.Row="0" Margin="8,6,8,4">
+                    <TextBlock Text="RUNNING PROCESSES" Foreground="#6B7280" FontSize="9" FontWeight="SemiBold"
+                               VerticalAlignment="Center"/>
+                </Grid>
+                <!-- Process list -->
+                <ListBox Grid.Row="1" x:Name="LstRunningProcesses"
+                         Background="Transparent" BorderThickness="0"
+                         Foreground="White" FontSize="13" FontFamily="Segoe UI"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         SelectionChanged="LstRunningProcesses_SelectionChanged">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="Padding" Value="8,4"/>
+                            <Setter Property="Cursor" Value="Hand"/>
+                            <EventSetter Event="PreviewMouseLeftButtonDown"
+                                         Handler="LstProcessItem_PreviewMouseDown"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ListBoxItem">
+                                        <Border x:Name="Bd" Background="Transparent" Padding="{TemplateBinding Padding}">
+                                            <ContentPresenter/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="Bd" Property="Background" Value="#1A1D28"/>
+                                            </Trigger>
+                                            <Trigger Property="IsSelected" Value="True">
+                                                <Setter TargetName="Bd" Property="Background" Value="#2A1A2E"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                </ListBox>
+                <!-- Footer with Add button -->
+                <Border Grid.Row="2" Background="#0A0C12" BorderBrush="#1A1D28" BorderThickness="0,1,0,0"
+                        CornerRadius="0,0,6,6" Padding="8,6">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="LblPickedProcess" Text="Select a process above"
+                                   Foreground="#4B5563" FontSize="10" FontFamily="Segoe UI"
+                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        <Button Grid.Column="1" Content="&#xE149;" FontFamily="Segoe MDL2 Assets"
+                                Style="{StaticResource DarkButton}" FontSize="12" Padding="10,0" Height="22"
+                                Margin="0,0,4,0"
+                                Click="BtnRefreshProcesses_Click" ToolTip="Refresh list"/>
+                        <Button Grid.Column="2" x:Name="BtnAddProcess" Content="Add"
+                                Style="{StaticResource DarkButton}" Height="22" Padding="10,0"
+                                IsEnabled="False" Click="BtnAddProcess_Click"/>
+                    </Grid>
+                </Border>
+            </Grid>
+        </Border>
+        <!-- Borderless Windowed Fullscreen toggle -->
+        <Grid x:Name="BorderlessRow" Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="&#xE740;" FontFamily="Segoe MDL2 Assets"
+                       FontSize="12" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock x:Name="LblBorderlessToggle"
+                           Text="Borderless Windowed Fullscreen"
+                           Foreground="White" FontSize="11" FontFamily="Segoe UI"
+                           VerticalAlignment="Center"/>
+                <!-- Info icon -->
+                <Border x:Name="InfoBorderless" Width="15" Height="15" CornerRadius="8"
+                        BorderThickness="1"
+                        Background="Transparent"
+                        Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                        IsEnabled="True"
+                        ToolTipService.InitialShowDelay="0"
+                        ToolTipService.ShowOnDisabled="True">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="BorderBrush" Value="#4B5563"/>
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                               FontFamily="Segoe UI" FontStyle="Italic"
+                               HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="#6B7280"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                        <Setter Property="Foreground" Value="#FF2AFF"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Border>
+            </StackPanel>
+            <ToggleButton Grid.Column="2" x:Name="ToggleBorderless"
+                          Style="{StaticResource ToggleSwitchStyle}"
+                          IsChecked="False"
+                          Checked="ToggleBorderless_Changed"
+                          Unchecked="ToggleBorderless_Changed"/>
+        </Grid>
+    </StackPanel>
+</Border>
+
+<!-- ═════ MULTI-SYSTEM EMULATORS ═════ -->
+<StackPanel x:Name="RomSystemsSection">
+<StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+    <TextBlock Text="&#xE7FC;" FontFamily="Segoe MDL2 Assets"
+               FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+    <TextBlock x:Name="LblRomSystemsHeader" Text="MULTI-SYSTEM EMULATOR (only)"
+               Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"
+               VerticalAlignment="Center"/>
+    <!-- Info icon -->
+    <Border x:Name="InfoMultiSystem" Width="15" Height="15" CornerRadius="8"
+                BorderThickness="1"
+                Background="Transparent"
+                Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                IsEnabled="True"
+                ToolTipService.InitialShowDelay="0"
+                ToolTipService.ShowOnDisabled="True">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="BorderBrush" Value="#4B5563"/>
+                    <Style.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                        </Trigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+            <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                       FontFamily="Segoe UI" FontStyle="Italic"
+                       HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="#6B7280"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                <Setter Property="Foreground" Value="#FF2AFF"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+        </Border>
+</StackPanel>
+
+<Border x:Name="RomSystemsBorder" Background="#151921" CornerRadius="10"
+        BorderBrush="#1A1D28" BorderThickness="1" Padding="16,14" Margin="0,0,0,16">
+    <StackPanel>
+        <!-- Toggle + System name label -->
+        <Grid Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <ToggleButton Grid.Column="0" x:Name="ToggleMultiSystemEnabled"
+                          Style="{StaticResource ToggleSwitchStyle}"
+                          IsChecked="False"
+                          Margin="0,0,8,0"
+                          Checked="ToggleMultiSystemEnabled_Changed"
+                          Unchecked="ToggleMultiSystemEnabled_Changed"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="&#xE8D4;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                           Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="LblRomSystemName" Text="SYSTEM NAME"
+                           Foreground="#6B7280" FontSize="10" FontWeight="SemiBold" FontFamily="Segoe UI"/>
+            </StackPanel>
+        </Grid>
+        <!-- Content enabled/disabled by the toggle -->
+        <StackPanel x:Name="RomSystemsContent" IsEnabled="False" Opacity="0.35">
+        <!-- System name ComboBox + Set + Scan + Reset + Delete -->
+        <Grid Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <ComboBox Grid.Column="0" x:Name="CmbSystems"
+                      Style="{StaticResource DarkComboBox}" IsEditable="True" Margin="0,0,8,0"
+                      SelectionChanged="CmbSystems_SelectionChanged"/>
+            <Button Grid.Column="1" x:Name="BtnRomSet" Content="Set"
+                    Style="{StaticResource DarkButton}" Click="BtnRomSet_Click" Margin="0,0,8,0">
+                <Button.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem x:Name="MenuCreateFolder" Header="Create new folder"
+                                  Click="MenuCreateFolder_Click"/>
+                        <MenuItem x:Name="MenuUseFolder" Header="Use existing folder"
+                                  Click="MenuUseFolder_Click"/>
+                    </ContextMenu>
+                </Button.ContextMenu>
+            </Button>
+            <Button Grid.Column="2" x:Name="BtnScanSystem" Content="Scan"
+                    Style="{StaticResource DarkButton}" Click="BtnScanSystem_Click" Margin="0,0,8,0"/>
+            <Button Grid.Column="3" x:Name="BtnResetRomSystem" Content="Reset"
+                    Style="{StaticResource DarkButton}" Click="BtnResetRomSystem_Click"
+                    Margin="0,0,8,0"/>
+            <Button Grid.Column="4" x:Name="BtnDeleteRomSystem"
+                    Style="{StaticResource DarkButton}" Click="BtnDeleteRomSystem_Click" Padding="10,6"/>
+        </Grid>
+        <!-- Linked ROM folder path -->
+        <TextBlock x:Name="LblRomFolder" Text="None"
+                   Foreground="#6B7280" FontSize="11" Margin="0,0,0,4"
+                   TextTrimming="CharacterEllipsis"/>
+        <!-- Scan result -->
+        <TextBlock x:Name="LblScanResult" Text=""
+                   Foreground="#6B7280" FontSize="11"/>
+        </StackPanel><!-- /RomSystemsContent -->
+    </StackPanel>
+</Border>
+</StackPanel><!-- /RomSystemsSection -->
+
+
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- ══════════════════════════════════════ -->
+            <!--     TAB 2 — SYSTEM SETTINGS           -->
+            <!-- ══════════════════════════════════════ -->
+            <ScrollViewer Grid.Row="2" x:Name="Tab2Content" Visibility="Collapsed"
+                          VerticalScrollBarVisibility="Hidden"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="18,14,18,8">
+
+                    <Grid Margin="0,0,0,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <!-- Left: WINDOW SIZE -->
+                        <StackPanel Grid.Column="0">
+                            <!-- ── WINDOW SIZE ── -->
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <TextBlock Text="&#xE8A4;" FontFamily="Segoe MDL2 Assets"
+                                           FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <TextBlock x:Name="LblWindowSizeHeader" Text="WINDOW SIZE"
+                                           Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"
+                                           TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                            <Border Background="#151921" CornerRadius="10"
+                                    BorderBrush="#1A1D28" BorderThickness="1"
+                                    Padding="16,14" Margin="0,0,0,0">
+                                <UniformGrid Rows="1" Columns="4">
+                                    <RadioButton x:Name="RadioScale1" GroupName="UiScale" Content="x1"
+                                                 Style="{StaticResource ScaleBtn}" Click="RadioScale_Click"
+                                                 Margin="0,0,4,0"/>
+                                    <RadioButton x:Name="RadioScale2" GroupName="UiScale" Content="x2"
+                                                 IsChecked="True"
+                                                 Style="{StaticResource ScaleBtn}" Click="RadioScale_Click"
+                                                 Margin="4,0,4,0"/>
+                                    <RadioButton x:Name="RadioScale3" GroupName="UiScale" Content="x3"
+                                                 Style="{StaticResource ScaleBtn}" Click="RadioScale_Click"
+                                                 Margin="4,0,4,0"/>
+                                    <RadioButton x:Name="RadioScale4" GroupName="UiScale" Content="x4"
+                                                 Style="{StaticResource ScaleBtn}" Click="RadioScale_Click"
+                                                 Margin="4,0,0,0"/>
+                                </UniformGrid>
+                            </Border>
+                        </StackPanel>
+                        <!-- Right: DISPLAY MONITOR -->
+                        <StackPanel Grid.Column="2" x:Name="MonitorSection">
+                            <!-- ── DISPLAY MONITOR ── -->
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <TextBlock Text="&#xE7F4;" FontFamily="Segoe MDL2 Assets"
+                                           FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <TextBlock x:Name="LblMonitorSectionHeader" Text="SCANLINES DISPLAY MONITOR (Desktop)"
+                                           Foreground="#6B7280" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           TextTrimming="CharacterEllipsis"/>
+                                <Border x:Name="InfoMonitor" Width="15" Height="15" CornerRadius="8"
+                                        BorderThickness="1" Background="Transparent"
+                                        Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                                        IsEnabled="True"
+                                        ToolTipService.InitialShowDelay="0"
+                                        ToolTipService.ShowOnDisabled="True">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Setter Property="BorderBrush" Value="#4B5563"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                                               FontFamily="Segoe UI" FontStyle="Italic"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                                        <Setter Property="Foreground" Value="#FF2AFF"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Border>
+                            </StackPanel>
+                            <Border Background="#151921" CornerRadius="10"
+                                    BorderBrush="#1A1D28" BorderThickness="1"
+                                    Padding="16,14" Margin="0,0,0,0">
+                                <UniformGrid Rows="1" Columns="4">
+                                    <RadioButton x:Name="Monitor1" GroupName="Monitor" Content="1"
+                                                 Style="{StaticResource ScaleBtn}" IsChecked="True"
+                                                 Margin="0,0,4,0"/>
+                                    <RadioButton x:Name="Monitor2" GroupName="Monitor" Content="2"
+                                                 Style="{StaticResource ScaleBtn}"
+                                                 Margin="4,0,4,0"/>
+                                    <RadioButton x:Name="Monitor3" GroupName="Monitor" Content="3"
+                                                 Style="{StaticResource ScaleBtn}"
+                                                 Margin="4,0,4,0"/>
+                                    <RadioButton x:Name="Monitor4" GroupName="Monitor" Content="4"
+                                                 Style="{StaticResource ScaleBtn}"
+                                                 Margin="4,0,0,0"/>
+                                </UniformGrid>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- ── SOFTWARE BEHAVIOR ── -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE770;" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LblBehaviorSectionHeader" Text="SOFTWARE BEHAVIOR"
+                                   Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+                    </StackPanel>
+
+                    <Border Background="#151921" CornerRadius="10"
+                            BorderBrush="#1A1D28" BorderThickness="1"
+                            Padding="16,14" Margin="0,0,0,16">
+                        <StackPanel>
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" x:Name="LblStartMinimized" Text="Start Minimized"
+                                           Foreground="White" FontSize="13" FontFamily="Segoe UI"
+                                           VerticalAlignment="Center"/>
+                                <ToggleButton Grid.Column="1" x:Name="ToggleStartMinimized"
+                                              Style="{StaticResource ToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleStartMinimized_Changed"
+                                              Unchecked="ToggleStartMinimized_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" x:Name="LblCloseToTray" Text="Close to Tray"
+                                           Foreground="White" FontSize="13" FontFamily="Segoe UI"
+                                           VerticalAlignment="Center"/>
+                                <ToggleButton Grid.Column="1" x:Name="ToggleCloseToTray"
+                                              Style="{StaticResource ToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleCloseToTray_Changed"
+                                              Unchecked="ToggleCloseToTray_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" x:Name="LblApplyDesktopAtStart"
+                                           Text="Apply Desktop profile at start"
+                                           Foreground="White" FontSize="13" FontFamily="Segoe UI"
+                                           VerticalAlignment="Center"/>
+                                <ToggleButton Grid.Column="1" x:Name="ToggleApplyDesktopAtStart"
+                                              Style="{StaticResource ToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleApplyDesktopAtStart_Changed"
+                                              Unchecked="ToggleApplyDesktopAtStart_Changed"/>
+                            </Grid>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" x:Name="LblStartWithWindows"
+                                           Text="Start with Windows"
+                                           Foreground="White" FontSize="13" FontFamily="Segoe UI"
+                                           VerticalAlignment="Center"/>
+                                <ToggleButton Grid.Column="1" x:Name="ToggleStartWithWindows"
+                                              Style="{StaticResource ToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleStartWithWindows_Changed"
+                                              Unchecked="ToggleStartWithWindows_Changed"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+
+                    <!-- ── GLOBAL SHORTCUTS ── -->
+<StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+    <TextBlock Text="&#xE765;" FontFamily="Segoe MDL2 Assets"
+               FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+    <TextBlock x:Name="LblShortcutsSectionHeader" Text="GLOBAL SHORTCUTS"
+               Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+</StackPanel>
+
+<Border Background="#151921" CornerRadius="10"
+        BorderBrush="#1A1D28" BorderThickness="1"
+        Padding="16,14" Margin="0,0,0,16">
+    <StackPanel>
+        <!-- Switch Bezel -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblSwitchBezelHotkey" Text="Switch Bezel"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnSwitchBezelBackHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnSwitchBezelBackHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnSwitchBezelHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnSwitchBezelHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblSwitchProfileHotkey" Text="Switch Profile"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnSwitchProfileBackHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnSwitchProfileBackHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnSwitchProfileHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnSwitchProfileHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtHOpacityHotkey" Text="Scanlines Opacity H"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnHOpacityDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnHOpacityDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnHOpacityUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnHOpacityUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtVOpacityHotkey" Text="Scanlines Opacity V"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnVOpacityDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnVOpacityDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnVOpacityUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnVOpacityUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtBlurHotkey" Text="Blur"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnBlurDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnBlurDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnBlurUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnBlurUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtBloomHotkey" Text="Bloom"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnBloomDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnBloomDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnBloomUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnBloomUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtFlickerHotkey" Text="Flicker"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnFlickerDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnFlickerDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnFlickerUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnFlickerUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtPhosphorHotkey" Text="Phosphor Glow"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnPhosphorDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnPhosphorDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnPhosphorUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnPhosphorUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtCurvatureHotkey" Text="Curvature"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnCurvatureDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnCurvatureDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnCurvatureUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnCurvatureUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtVhsHotkey" Text="VHS Intensity"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnVhsDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnVhsDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnVhsUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnVhsUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtGrainHotkey" Text="Grain Intensity"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnGrainDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnGrainDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnGrainUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnGrainUpHotkey_Click"/>
+        </Grid>
+        <Grid Margin="0,5,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" x:Name="LblCrtTapeNoiseHotkey" Text="Tape Noise Intensity"
+                       Foreground="White" FontSize="13" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" x:Name="BtnTapeNoiseDownHotkey"
+                    Content="&#x25C4; None" Style="{StaticResource HotkeyButton}"
+                    Margin="0,0,6,0" Click="BtnTapeNoiseDownHotkey_Click"/>
+            <Button Grid.Column="2" x:Name="BtnTapeNoiseUpHotkey"
+                    Content="None &#x25BA;" Style="{StaticResource HotkeyButton}"
+                    Click="BtnTapeNoiseUpHotkey_Click"/>
+        </Grid>
+    </StackPanel>
+</Border>
+
+
+                    <!-- ── LANGUAGE & REGION ── -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE774;" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LblLanguageSectionHeader" Text="LANGUAGE &amp; REGION"
+                                   Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+                    </StackPanel>
+
+                    <ComboBox x:Name="CmbLanguage" Style="{StaticResource DarkComboBox}"
+                              SelectionChanged="CmbLanguage_SelectionChanged" Margin="0,0,0,16">
+                        <ComboBoxItem Content="English (ENG)" IsSelected="True"/>
+                        <ComboBoxItem Content="Français (FR)"/>
+                        <ComboBoxItem Content="Deutsch (DE)"/>
+                        <ComboBoxItem Content="Italiano (IT)"/>
+                        <ComboBoxItem Content="Español (ES)"/>
+                        <ComboBoxItem Content="Português (PT-BR)"/>
+                    </ComboBox>
+
+                    <!-- ── BACKUP & RESTORE ── -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE753;" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="LblBackupSectionHeader" Text="BACKUP &amp; RESTORE"
+                                   Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
+                    </StackPanel>
+
+                    <Border Background="#151921" CornerRadius="10"
+                            BorderBrush="#1A1D28" BorderThickness="1"
+                            Padding="16,14" Margin="0,0,0,8">
+                        <StackPanel>
+                            <TextBlock x:Name="LblBackupDesc"
+                                       Text="Export all your settings, profiles, paths and shortcuts to a single file. Import it to restore everything."
+                                       Foreground="#6B7280" FontSize="11" FontFamily="Segoe UI"
+                                       TextWrapping="Wrap" Margin="0,0,0,14"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Button Grid.Column="0" x:Name="BtnExportBtn"
+                                        Style="{StaticResource DarkButton}"
+                                        Click="BtnExport_Click">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="&#xE74E;" FontFamily="Segoe MDL2 Assets"
+                                                   FontSize="12" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                        <TextBlock x:Name="TxtBtnExport" Text="EXPORT"/>
+                                    </StackPanel>
+                                </Button>
+                                <Button Grid.Column="2" x:Name="BtnImportBtn"
+                                        Style="{StaticResource DarkButton}"
+                                        Click="BtnImport_Click">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="&#xE8B5;" FontFamily="Segoe MDL2 Assets"
+                                                   FontSize="12" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                        <TextBlock x:Name="TxtBtnImport" Text="IMPORT"/>
+                                    </StackPanel>
+                                </Button>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- ══════════════════════════════════════ -->
+            <!--     TAB 3 — CRT EFFECTS               -->
+            <!-- ══════════════════════════════════════ -->
+            <ScrollViewer Grid.Row="2" x:Name="Tab3Content" Visibility="Collapsed"
+                          VerticalScrollBarVisibility="Hidden"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="18,14,18,8">
+
+                    <!-- CRT EFFECTS header + Preset controls -->
+                    <Grid Margin="0,0,0,10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- Row 0: section title -->
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE71C;" FontFamily="Segoe MDL2 Assets"
+                                       FontSize="12" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <TextBlock x:Name="LblCrtEffectsHeader" Text="SHADER EFFECTS"
+                                       Foreground="#6B7280" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <Border x:Name="InfoCrtEffectsTab" Width="15" Height="15" CornerRadius="8"
+                                    BorderThickness="1" Background="Transparent"
+                                    Margin="6,0,0,0" VerticalAlignment="Center" Cursor="Hand"
+                                    IsEnabled="True"
+                                    ToolTipService.InitialShowDelay="0"
+                                    ToolTipService.ShowOnDisabled="True">
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Setter Property="BorderBrush" Value="#4B5563"/>
+                                        <Style.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                            </Trigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                                <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                                           FontFamily="Segoe UI" FontStyle="Italic"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="#6B7280"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                                    <Setter Property="Foreground" Value="#FF2AFF"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Border>
+                        </StackPanel>
+
+                        <!-- Row 1: preset controls -->
+                        <Grid Grid.Row="1" Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Preset label -->
+                            <TextBlock Grid.Column="0" Text="PRESET" Foreground="#4B5563"
+                                       FontSize="9" FontWeight="SemiBold" VerticalAlignment="Center"
+                                       Margin="0,0,6,0"/>
+
+                            <!-- Preset name TextBox -->
+                            <TextBox Grid.Column="1" x:Name="TxtCrtPresetName"
+                                     Style="{StaticResource DarkTextBox}"
+                                     Height="34" FontSize="12" Padding="8,4"
+                                     VerticalContentAlignment="Center"/>
+
+                            <!-- Prev arrow -->
+                            <Button Grid.Column="2" x:Name="BtnPresetPrev" Content="◀"
+                                    Width="28" Height="34" Padding="0"
+                                    Click="BtnPresetPrev_Click">
+                                <Button.Style>
+                                    <Style TargetType="Button">
+                                        <Setter Property="Background" Value="#1E2230"/>
+                                        <Setter Property="Foreground" Value="#6B7280"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="Button">
+                                                    <Border Background="{TemplateBinding Background}"
+                                                            BorderBrush="#2A2D38" BorderThickness="1"
+                                                            CornerRadius="6,0,0,6">
+                                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Background" Value="#2A2D38"/>
+                                                            <Setter Property="Foreground" Value="White"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+
+                            <!-- Next arrow -->
+                            <Button Grid.Column="3" x:Name="BtnPresetNext" Content="▶"
+                                    Width="28" Height="34" Padding="0"
+                                    Click="BtnPresetNext_Click">
+                                <Button.Style>
+                                    <Style TargetType="Button">
+                                        <Setter Property="Background" Value="#1E2230"/>
+                                        <Setter Property="Foreground" Value="#6B7280"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="Button">
+                                                    <Border Background="{TemplateBinding Background}"
+                                                            BorderBrush="#2A2D38" BorderThickness="1"
+                                                            CornerRadius="0,6,6,0">
+                                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Background" Value="#2A2D38"/>
+                                                            <Setter Property="Foreground" Value="White"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+
+                            <!-- Save preset -->
+                            <Button Grid.Column="4" x:Name="BtnPresetSave" Content="Save"
+                                    Style="{StaticResource DarkButton}"
+                                    Height="34" Padding="12,4" Margin="8,0,0,0"
+                                    Click="BtnPresetSave_Click"/>
+
+                            <!-- Delete preset -->
+                            <Button Grid.Column="5" x:Name="BtnPresetDelete"
+                                    Style="{StaticResource DarkButton}"
+                                    Height="34" Padding="10,4" Margin="6,0,0,0"
+                                    Click="BtnPresetDelete_Click"/>
+                        </Grid>
+                    </Grid>
+
+                    <StackPanel x:Name="CrtEffectsBody" Grid.IsSharedSizeScope="True">
+
+                    <!-- CRT EFFECTS GROUP (Curvature / Blur / Bloom / Flicker / Phosphor / Luma) -->
+                    <Border Background="#0D1117" CornerRadius="12" Padding="16,18" Margin="0,0,0,16"
+                            BorderBrush="#1E2230" BorderThickness="1">
+                        <StackPanel>
+                            <!-- Master header -->
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox x:Name="ToggleCrtGroup" Grid.Column="0"
+                                          Style="{StaticResource ToggleSwitchStyle}"
+                                          IsChecked="True"
+                                          Checked="ToggleCrtGroup_Changed" Unchecked="ToggleCrtGroup_Changed"/>
+                                <TextBlock Grid.Column="1" x:Name="LblCrtGroupTitle" Text="CRT"
+                                           Foreground="White" FontSize="13" FontWeight="Bold"
+                                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                <Border x:Name="InfoCrtGroup" Grid.Column="2" Width="15" Height="15" CornerRadius="8"
+                                        BorderThickness="1" Background="Transparent"
+                                        Margin="6,0,4,0" VerticalAlignment="Center" Cursor="Hand"
+                                        IsEnabled="True"
+                                        ToolTipService.InitialShowDelay="0"
+                                        ToolTipService.ShowOnDisabled="True">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Setter Property="BorderBrush" Value="#4B5563"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                                               FontFamily="Segoe UI" FontStyle="Italic"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                                        <Setter Property="Foreground" Value="#FF2AFF"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Border>
+                                <Button x:Name="BtnCollapseCrtGroup" Grid.Column="4"
+                                        Style="{StaticResource CrtCollapseBtn}"
+                                        Click="BtnCollapseCrtGroup_Click"
+                                        VerticalAlignment="Center" Content="▲"/>
+                            </Grid>
+
+                            <StackPanel x:Name="CrtGroupBody" Visibility="Visible">
+                                <StackPanel x:Name="CrtGroupContentPanel">
+
+                                <!-- ── CURVATURE ── -->
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleCurvature" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleCurvature_Changed" Unchecked="ToggleCurvature_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblCurvatureTitle" Text="CURVATURE"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                                HorizontalAlignment="Right" VerticalAlignment="Center">
+                                        <TextBlock x:Name="LblVignetteTitle" Text="EDGE FADE"
+                                                   Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                                   VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                        <CheckBox x:Name="ToggleVignette"
+                                                  Style="{StaticResource SmallToggleSwitchStyle}"
+                                                  IsChecked="False" IsEnabled="False"
+                                                  Checked="ToggleVignette_Changed" Unchecked="ToggleVignette_Changed"/>
+                                    </StackPanel>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblCurvatureAmount" Text="AMOUNT"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderCurvature" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0" IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderCurvature_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtCurvaturePct"
+                                               Text="{Binding Value, ElementName=SliderCurvature, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- ── BLUR ── -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleBlur" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleBlur_Changed" Unchecked="ToggleBlur_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblBlurTitle" Text="BLUR"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblBlurIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderBlur" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0" IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtBlurPct"
+                                               Text="{Binding Value, ElementName=SliderBlur, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- ── BLOOM ── -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleBloom" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleBloom_Changed" Unchecked="ToggleBloom_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblBloomTitle" Text="BLOOM"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblBloomIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderBloom" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0" IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderBloom_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtBloomPct"
+                                               Text="{Binding Value, ElementName=SliderBloom, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- ── FLICKER ── -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleFlicker" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleFlicker_Changed" Unchecked="ToggleFlicker_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblFlickerTitle" Text="FLICKER"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblFlickerIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderFlicker" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderFlicker_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtFlickerPct"
+                                               Text="{Binding Value, ElementName=SliderFlicker, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,8,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblFlickerRate" Text="RATE"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderFlickerRate" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="25"
+                                            IsEnabled="False"
+                                            Tag="25" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderFlickerRate_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtFlickerRatePct"
+                                               Text="{Binding Value, ElementName=SliderFlickerRate, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- ── PHOSPHOR GLOW ── -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="TogglePhosphor" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="TogglePhosphor_Changed" Unchecked="TogglePhosphor_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblPhosphorTitle" Text="PHOSPHOR GLOW"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblPhosphorIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderPhosphor" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderPhosphor_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtPhosphorPct"
+                                               Text="{Binding Value, ElementName=SliderPhosphor, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- ── LUMINOSITY COMPENSATION ── -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleLuma" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleLuma_Changed" Unchecked="ToggleLuma_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblLumaTitle" Text="LUMINOSITY COMPENSATION"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <!-- Brightness slider -->
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblBrightnessLbl" Text="BRIGHTNESS"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderBrightness" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="-100" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderBrightness_ValueChanged"
+                                            Loaded="CenterSlider_Loaded"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtBrightnessPct"
+                                               Text="{Binding Value, ElementName=SliderBrightness, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Contrast slider -->
+                                <Grid Margin="0,10,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblContrastLbl" Text="CONTRAST"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderContrast" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="-100" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderContrast_ValueChanged"
+                                            Loaded="CenterSlider_Loaded"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtContrastPct"
+                                               Text="{Binding Value, ElementName=SliderContrast, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Saturation slider -->
+                                <Grid Margin="0,10,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblSaturationLbl" Text="SATURATION"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderSaturation" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="-100" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderSaturation_ValueChanged"
+                                            Loaded="CenterSlider_Loaded"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtSaturationPct"
+                                               Text="{Binding Value, ElementName=SliderSaturation, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Temperature slider -->
+                                <Grid Margin="0,10,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblTemperatureLbl" Text="TEMPERATURE"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderTemperature" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="-100" Maximum="100" Value="0"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderTemperature_ValueChanged"
+                                            Loaded="CenterSlider_Loaded"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtTemperaturePct"
+                                               Text="{Binding Value, ElementName=SliderTemperature, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Black Level slider -->
+                                <Grid Margin="0,10,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblBlackLevelLbl" Text="BLACK LEVEL"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderBlackLevel" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="0"
+                                            SmallChange="1" LargeChange="5"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderBlackLevel_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtBlackLevelVal"
+                                               Text="{Binding Value, ElementName=SliderBlackLevel, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Gamma slider -->
+                                <Grid Margin="0,10,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblGammaLbl" Text="GAMMA"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderGamma" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="50" Maximum="200" Value="100"
+                                            SmallChange="1" LargeChange="5"
+                                            IsEnabled="False"
+                                            Tag="100" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderGamma_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtGammaVal"
+                                               Text="{Binding Value, ElementName=SliderGamma, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                </StackPanel><!-- /CrtGroupContentPanel -->
+                            </StackPanel><!-- /CrtGroupBody -->
+                        </StackPanel>
+                    </Border>
+
+                    <!-- ═══════ VHS + FILM GRAIN ═══════ -->
+                    <Border Background="#0D1017" CornerRadius="10" Padding="18,18"
+                            Margin="0,0,0,12" BorderBrush="#1A1D28" BorderThickness="1">
+                        <StackPanel>
+                            <!-- Header with toggle -->
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox x:Name="ToggleVhs" Grid.Column="0"
+                                          Style="{StaticResource ToggleSwitchStyle}"
+                                          IsChecked="False"
+                                          Checked="ToggleVhs_Changed" Unchecked="ToggleVhs_Changed"/>
+                                <TextBlock Grid.Column="1" x:Name="LblVhsTitle" Text="VHS"
+                                           Foreground="#555555" FontSize="13" FontWeight="Bold"
+                                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                <Border x:Name="InfoVhs" Grid.Column="2" Width="15" Height="15" CornerRadius="8"
+                                        BorderThickness="1" Background="Transparent"
+                                        Margin="6,0,4,0" VerticalAlignment="Center" Cursor="Hand"
+                                        IsEnabled="True"
+                                        ToolTipService.InitialShowDelay="0"
+                                        ToolTipService.ShowOnDisabled="True">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Setter Property="BorderBrush" Value="#4B5563"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="BorderBrush" Value="#FF2AFF"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock Text="i" FontSize="9" FontWeight="Bold"
+                                               FontFamily="Segoe UI" FontStyle="Italic"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Border}}" Value="True">
+                                                        <Setter Property="Foreground" Value="#FF2AFF"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Border>
+                                <Button x:Name="BtnCollapseVhs" Grid.Column="4"
+                                        Style="{StaticResource CrtCollapseBtn}"
+                                        Click="BtnCollapseVhs_Click"
+                                        VerticalAlignment="Center" Content="▲"/>
+                            </Grid>
+
+                            <StackPanel x:Name="VhsBody" Visibility="Visible">
+                                <!-- VHS Effect sub-toggle -->
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleVhsEffect" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="True"
+                                              Checked="ToggleVhsEffect_Changed" Unchecked="ToggleVhsEffect_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblVhsEffectTitle" Text="VHS EFFECT"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <!-- VHS Intensity slider -->
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblVhsIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderVhs" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="50"
+                                            SmallChange="1" LargeChange="5"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderVhs_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtVhsPct"
+                                               Text="{Binding Value, ElementName=SliderVhs, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- Film Grain sub-toggle -->
+                                <Grid Margin="0,16,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleGrain" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleGrain_Changed" Unchecked="ToggleGrain_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblGrainTitle" Text="FILM GRAIN"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+
+                                <!-- Grain Intensity slider -->
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblGrainIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderGrain" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="30"
+                                            SmallChange="1" LargeChange="5"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderGrain_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtGrainPct"
+                                               Text="{Binding Value, ElementName=SliderGrain, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                <!-- Tape Noise sub-toggle -->
+                                <Grid Margin="0,8,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="ToggleTapeNoise" Grid.Column="0"
+                                              Style="{StaticResource SmallToggleSwitchStyle}"
+                                              IsChecked="False"
+                                              Checked="ToggleTapeNoise_Changed" Unchecked="ToggleTapeNoise_Changed"/>
+                                    <TextBlock Grid.Column="1" x:Name="LblTapeNoiseTitle" Text="TAPE NOISE"
+                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblTapeNoiseIntensity" Text="INTENSITY"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderTapeNoise" Grid.Column="1"
+                                            Style="{StaticResource GraySlider}"
+                                            Minimum="0" Maximum="100" Value="50"
+                                            SmallChange="1" LargeChange="5"
+                                            IsEnabled="False"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            AutoToolTipPlacement="TopLeft"
+                                            ValueChanged="SliderTapeNoise_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtTapeNoisePct"
+                                               Text="{Binding Value, ElementName=SliderTapeNoise, StringFormat={}{0:0}%}"
+                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+
+                                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    </StackPanel><!-- /CrtEffectsBody -->
+
+                </StackPanel>
+            </ScrollViewer>
+
+                        <!-- ═══════ FOOTER ═══════ -->
+            <Border Grid.Row="3" Background="#080A10" Padding="18,10,18,10">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+
+                    <!-- SAVE : sombre au repos, flash rose au clic -->
+                    <Button x:Name="BtnSaveBtn" Click="BtnSave_Click"
+                            Cursor="Hand" Margin="0,0,12,0">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="#1E2230"/>
+                                <Setter Property="Foreground" Value="White"/>
+                                <Setter Property="BorderBrush" Value="#2A2D38"/>
+                                <Setter Property="BorderThickness" Value="1"/>
+                                <Setter Property="Height" Value="40"/>
+                                <Setter Property="Padding" Value="20,0"/>
+                                <Setter Property="FontFamily" Value="Segoe UI"/>
+                                <Setter Property="FontSize" Value="14"/>
+                                <Setter Property="FontWeight" Value="Bold"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="Button">
+                                            <Border x:Name="Bd"
+                                                    Background="{TemplateBinding Background}"
+                                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                                    CornerRadius="20" Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#2A2D38"/>
+                                                </Trigger>
+                                                <Trigger Property="IsPressed" Value="True">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#FF2AFF"/>
+                                                    <Setter Property="Foreground" Value="#1A0A1A"/>
+                                                </Trigger>
+                                                <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="flash">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#FF2AFF"/>
+                                                    <Setter Property="Foreground" Value="#1A0A1A"/>
+                                                </DataTrigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </Button.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE74E;" FontFamily="Segoe MDL2 Assets"
+                                       FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBlock x:Name="TxtBtnSave" Text="Save"
+                                       FontSize="14" FontWeight="Bold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+
+                    <!-- APPLY : sombre au repos, rose enfoncé quand overlay actif -->
+                    <Button x:Name="BtnApplyBtn" Click="BtnApply_Click"
+                            Cursor="Hand">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="#1E2230"/>
+                                <Setter Property="Foreground" Value="White"/>
+                                <Setter Property="BorderBrush" Value="#2A2D38"/>
+                                <Setter Property="BorderThickness" Value="1"/>
+                                <Setter Property="Height" Value="40"/>
+                                <Setter Property="Padding" Value="20,0"/>
+                                <Setter Property="FontFamily" Value="Segoe UI"/>
+                                <Setter Property="FontSize" Value="14"/>
+                                <Setter Property="FontWeight" Value="Bold"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="Button">
+                                            <Border x:Name="Bd"
+                                                    Background="{TemplateBinding Background}"
+                                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                                    CornerRadius="20" Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#2A2D38"/>
+                                                </Trigger>
+                                                <Trigger Property="IsPressed" Value="True">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#FF2AFF"/>
+                                                    <Setter Property="Foreground" Value="#1A0A1A"/>
+                                                </Trigger>
+                                                <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="active">
+                                                    <Setter TargetName="Bd" Property="Background" Value="#FF2AFF"/>
+                                                    <Setter Property="Foreground" Value="#1A0A1A"/>
+                                                    <Setter TargetName="Bd" Property="BorderBrush" Value="#FF2AFF"/>
+                                                </DataTrigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </Button.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE7E8;" FontFamily="Segoe MDL2 Assets"
+                                       FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBlock x:Name="TxtBtnApply" Text="Apply"
+                                       FontSize="14" FontWeight="Bold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+
+                </StackPanel>
+            </Border>
+
+            <!-- ═══════ STATUS BAR ═══════ -->
+            <Border Grid.Row="4" Background="#080A10" CornerRadius="0,0,12,12"
+                    Padding="16,7,16,7">
+                <Grid>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Ellipse x:Name="StatusDot" Width="7" Height="7" Fill="#22C55E" Margin="0,0,6,0"/>
+                        <TextBlock x:Name="LblStatus" Text="READY" Foreground="#22C55E"
+                                   FontSize="11" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                                VerticalAlignment="Center">
+                        <!-- Update available button — hidden until update detected -->
+                        <Button x:Name="BtnUpdateAvailable" Visibility="Collapsed"
+                                Cursor="Hand" Margin="0,0,10,0"
+                                Click="BtnUpdateAvailable_Click">
+                            <Button.Style>
+                                <Style TargetType="Button">
+                                    <Setter Property="Background" Value="Transparent"/>
+                                    <Setter Property="BorderThickness" Value="0"/>
+                                    <Setter Property="Padding" Value="0"/>
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="Button">
+                                                <ContentPresenter/>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter Property="Opacity" Value="0.75"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </Style>
+                            </Button.Style>
+                            <TextBlock x:Name="LblUpdateAvailable" Text="● UPDATE AVAILABLE"
+                                       Foreground="#FF2AFF" FontSize="11" FontFamily="Segoe UI"
+                                       FontWeight="SemiBold"/>
+                        </Button>
+                        <TextBlock x:Name="LblAppVersion" Text="v1.2"
+                                   Foreground="#6B7280" FontSize="11" FontFamily="Consolas"
+                                   VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+        </Grid>
+    </Border>
+</Window>

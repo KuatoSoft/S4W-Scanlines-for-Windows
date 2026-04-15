@@ -1,0 +1,31 @@
+# Build output
+bin/
+obj/
+
+# IDE / Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Compile artifacts
+*.obj
+*.pdb
+*.log
+
+# Hook compile logs
+Hook/compile_*.txt
+Hook/nul
+
+# Backup files
+*.bak
+*.s4w
+
+# Photoshop / Illustrator source files
+*.psd
+*.ai

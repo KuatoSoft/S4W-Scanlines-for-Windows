@@ -1,0 +1,16 @@
+<Window x:Class="S4W.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize">
+    <Grid x:Name="RootGrid" IsHitTestVisible="False">
+        <!-- Layer 2: Scanlines (rendered below) — starts Collapsed; shown only for Desktop legacy mode -->
+        <Grid x:Name="ScanlineHost" IsHitTestVisible="False" Visibility="Collapsed"/>
+        <!-- Layer 1: Bezel image (rendered on top) -->
+        <Image x:Name="BezelImage" Stretch="Fill" IsHitTestVisible="False"/>
+    </Grid>
+</Window>
