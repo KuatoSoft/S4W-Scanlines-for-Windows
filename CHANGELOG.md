@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.3 (Beta)
+## v1.3
 
 ### ★ New feature
 
