@@ -150,6 +150,18 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint lpdwProcessId);
 
+    // ── Reliable keyboard-focus routing for the no-activate main window ──
+    // AttachThreadInput lets SetForegroundWindow succeed even when Windows'
+    // foreground-lock / UIPI would otherwise silently block it (the reason some
+    // users could only type in the profile field when running as admin). We
+    // attach to the current foreground thread only for the instant we hand the
+    // keyboard to a text control, then detach immediately.
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hwnd);
 

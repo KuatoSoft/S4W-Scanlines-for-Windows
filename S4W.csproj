@@ -28,4 +28,15 @@
     <PackageReference Include="Vortice.DXGI" Version="2.*" />
   </ItemGroup>
 
+  <!-- Copy Bezels folder to output; always create the directory even when empty -->
+  <ItemGroup>
+    <Content Include="Bezels\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="EnsureBezelsFolderInOutput" AfterTargets="Build">
+    <MakeDir Directories="$(OutputPath)Bezels" />
+  </Target>
+
 </Project>

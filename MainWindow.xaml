@@ -789,7 +789,7 @@
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
                         <TextBlock Text="&#xE753;" FontFamily="Segoe MDL2 Assets"
                                    FontSize="13" Foreground="#6B7280" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                        <TextBlock x:Name="LblBezelSectionHeader" Text="BEZEL"
+                        <TextBlock x:Name="LblBezelSectionHeader" Text="BEZEL &amp; GEOMETRY"
                                    Foreground="#6B7280" FontSize="13" FontWeight="SemiBold"/>
                         <Border x:Name="InfoBezel" Width="15" Height="15" CornerRadius="8"
                                 BorderThickness="1" Background="Transparent"
@@ -827,7 +827,7 @@
                     <Border Background="#151921" CornerRadius="10"
                             BorderBrush="#1A1D28" BorderThickness="1"
                             Padding="16,16" Margin="0,0,0,16">
-                        <StackPanel>
+                        <StackPanel Grid.IsSharedSizeScope="True">
                             <!-- FILE PATH header + enable toggle -->
                             <Grid Margin="0,0,0,6">
                                 <Grid.ColumnDefinitions>
@@ -918,23 +918,198 @@
                                     <Button Grid.Column="4" x:Name="BtnBezelResetBtn" Content="Reset"
                                             Style="{StaticResource DarkButton}" Click="BtnBezelReset_Click"/>
                                 </Grid>
-                                <Grid Margin="0,0,0,6">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock x:Name="LblBezelOpacity" Text="OPACITY"
-                                               Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
-                                               FontFamily="Segoe UI"/>
-                                    <TextBlock Grid.Column="1" x:Name="TxtBezelOpacityPct"
-                                               Text="{Binding Value, ElementName=SliderBezelOpacity, StringFormat={}{0:0}%}"
-                                               Foreground="#FF2AFF" FontSize="12" FontWeight="SemiBold"/>
-                                </Grid>
-                                <Slider x:Name="SliderBezelOpacity"
+                            </StackPanel>
+
+                            <!-- ── CURVATURE (relocated from CRT effects — now part of bezel) ── -->
+                            <Rectangle Height="1" Fill="#1A1D28" Margin="0,12,0,10"/>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox x:Name="ToggleCurvature" Grid.Column="0"
+                                          Style="{StaticResource SmallToggleSwitchStyle}"
+                                          IsChecked="False"
+                                          Checked="ToggleCurvature_Changed" Unchecked="ToggleCurvature_Changed"/>
+                                <TextBlock Grid.Column="1" x:Name="LblCurvatureTitle" Text="CURVATURE"
+                                           Foreground="#555555" FontSize="10" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="LblCurvatureAmount" Text="AMOUNT"
+                                           Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <Slider x:Name="SliderCurvature" Grid.Column="1"
+                                        Style="{StaticResource GraySlider}"
+                                        Minimum="0" Maximum="100" Value="0" IsEnabled="False"
+                                        Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                        AutoToolTipPlacement="TopLeft"
+                                        ValueChanged="SliderCurvature_ValueChanged"
+                                        VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="2" x:Name="TxtCurvaturePct"
+                                           Text="{Binding Value, ElementName=SliderCurvature, StringFormat={}{0:0}%}"
+                                           Foreground="#555555" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </Grid>
+
+                            <!-- GAME CORNERS — rounds the game corners with a black fill
+                                 (replaces the old EDGE FADE toggle). Independent of curvature.
+                                 0 = off; slider right = more rounding. -->
+                            <Grid Margin="0,8,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="LblGameCorners" Text="GAME CORNERS"
+                                           Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <Slider x:Name="SliderGameCorners" Grid.Column="1"
                                         Style="{StaticResource PinkSlider}"
                                         Minimum="0" Maximum="100" Value="0"
                                         Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
-                                        AutoToolTipPlacement="TopLeft"/>
+                                        AutoToolTipPlacement="TopLeft"
+                                        ValueChanged="SliderGameCorners_ValueChanged"
+                                        VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="2" x:Name="TxtGameCornersPct"
+                                           Text="{Binding Value, ElementName=SliderGameCorners, StringFormat={}{0:0}%}"
+                                           Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </Grid>
+
+                            <!-- ── BEZEL REFLECTION ── -->
+                            <Rectangle Height="1" Fill="#1A1D28" Margin="0,12,0,10"/>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox Grid.Column="0" x:Name="ToggleMegaBezel"
+                                          Style="{StaticResource SmallToggleSwitchStyle}"
+                                          IsChecked="False"
+                                          Margin="0,0,8,0"
+                                          Checked="ToggleMegaBezel_Changed"
+                                          Unchecked="ToggleMegaBezel_Changed"/>
+                                <TextBlock Grid.Column="1" Text="BEZEL REFLECTION"
+                                           Foreground="#6B7280" FontSize="10" FontWeight="SemiBold"
+                                           FontFamily="Segoe UI" VerticalAlignment="Center"/>
+                            </Grid>
+                            <StackPanel x:Name="MegaBezelContentPanel" IsEnabled="False" Opacity="0.35">
+                                <!-- Resize -->
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblMegaBezelThickness" Text="GAME SIZE"
+                                               Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderMegaBezelThickness" Grid.Column="1"
+                                            Style="{StaticResource PinkSlider}"
+                                            Minimum="0" Maximum="100" Value="50"
+                                            Tag="50" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            ValueChanged="SliderMegaBezel_ValueChanged"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtMegaBezelThicknessPct"
+                                               Text="{Binding Value, ElementName=SliderMegaBezelThickness, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Opacity -->
+                                <Grid Margin="0,8,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblMegaBezelOpacity" Text="OPACITY"
+                                               Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderMegaBezelOpacity" Grid.Column="1"
+                                            Style="{StaticResource PinkSlider}"
+                                            Minimum="0" Maximum="100" Value="70"
+                                            Tag="70" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            ValueChanged="SliderMegaBezel_ValueChanged"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtMegaBezelOpacityPct"
+                                               Text="{Binding Value, ElementName=SliderMegaBezelOpacity, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Blur -->
+                                <Grid Margin="0,8,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblMegaBezelBlur" Text="BLUR"
+                                               Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderMegaBezelBlur" Grid.Column="1"
+                                            Style="{StaticResource PinkSlider}"
+                                            Minimum="0" Maximum="100" Value="30"
+                                            Tag="30" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            ValueChanged="SliderMegaBezel_ValueChanged"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtMegaBezelBlurPct"
+                                               Text="{Binding Value, ElementName=SliderMegaBezelBlur, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Reflection Width -->
+                                <Grid Margin="0,8,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblMegaBezelReflectionWidth" Text="REFLECTION SIZE"
+                                               Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderMegaBezelReflectionWidth" Grid.Column="1"
+                                            Style="{StaticResource PinkSlider}"
+                                            Minimum="0" Maximum="100" Value="100"
+                                            Tag="100" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            ValueChanged="SliderMegaBezel_ValueChanged"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtMegaBezelReflectionWidthPct"
+                                               Text="{Binding Value, ElementName=SliderMegaBezelReflectionWidth, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
+                                <!-- Corner Radius -->
+                                <Grid Margin="0,8,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="BezelReflLabel"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LblMegaBezelRadius" Text="CORNER"
+                                               Foreground="#6B7280" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <Slider x:Name="SliderMegaBezelRadius" Grid.Column="1"
+                                            Style="{StaticResource PinkSlider}"
+                                            Minimum="0" Maximum="100" Value="0"
+                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
+                                            ValueChanged="SliderMegaBezel_ValueChanged"
+                                            AutoToolTipPlacement="TopLeft"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock Grid.Column="2" x:Name="TxtMegaBezelRadiusPct"
+                                               Text="{Binding Value, ElementName=SliderMegaBezelRadius, StringFormat={}{0:0}%}"
+                                               Foreground="#FF2AFF" FontSize="11" FontWeight="SemiBold"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </Grid>
                             </StackPanel>
                         </StackPanel>
                     </Border>
@@ -2136,52 +2311,6 @@
                             <StackPanel x:Name="CrtGroupBody" Visibility="Visible">
                                 <StackPanel x:Name="CrtGroupContentPanel">
 
-                                <!-- ── CURVATURE ── -->
-                                <Grid Margin="0,0,0,8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <CheckBox x:Name="ToggleCurvature" Grid.Column="0"
-                                              Style="{StaticResource SmallToggleSwitchStyle}"
-                                              IsChecked="False"
-                                              Checked="ToggleCurvature_Changed" Unchecked="ToggleCurvature_Changed"/>
-                                    <TextBlock Grid.Column="1" x:Name="LblCurvatureTitle" Text="CURVATURE"
-                                               Foreground="#555555" FontSize="10" FontWeight="SemiBold"
-                                               VerticalAlignment="Center" Margin="12,0,0,0"/>
-                                    <StackPanel Grid.Column="1" Orientation="Horizontal"
-                                                HorizontalAlignment="Right" VerticalAlignment="Center">
-                                        <TextBlock x:Name="LblVignetteTitle" Text="EDGE FADE"
-                                                   Foreground="#555555" FontSize="10" FontWeight="SemiBold"
-                                                   VerticalAlignment="Center" Margin="0,0,6,0"/>
-                                        <CheckBox x:Name="ToggleVignette"
-                                                  Style="{StaticResource SmallToggleSwitchStyle}"
-                                                  IsChecked="False" IsEnabled="False"
-                                                  Checked="ToggleVignette_Changed" Unchecked="ToggleVignette_Changed"/>
-                                    </StackPanel>
-                                </Grid>
-                                <Grid Margin="0,0,0,6">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock x:Name="LblCurvatureAmount" Text="AMOUNT"
-                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
-                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                    <Slider x:Name="SliderCurvature" Grid.Column="1"
-                                            Style="{StaticResource GraySlider}"
-                                            Minimum="0" Maximum="100" Value="0" IsEnabled="False"
-                                            Tag="0" PreviewMouseLeftButtonDown="Slider_ResetOnDoubleClick"
-                                            AutoToolTipPlacement="TopLeft"
-                                            ValueChanged="SliderCurvature_ValueChanged"
-                                            VerticalAlignment="Center"/>
-                                    <TextBlock Grid.Column="2" x:Name="TxtCurvaturePct"
-                                               Text="{Binding Value, ElementName=SliderCurvature, StringFormat={}{0:0}%}"
-                                               Foreground="#555555" FontSize="11" FontWeight="SemiBold"
-                                               VerticalAlignment="Center" Margin="8,0,0,0"/>
-                                </Grid>
-
                                 <!-- ── BLUR ── -->
                                 <Grid Margin="0,16,0,8">
                                     <Grid.ColumnDefinitions>
@@ -2388,7 +2517,7 @@
                                                VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 <!-- Contrast slider -->
-                                <Grid Margin="0,10,0,6">
+                                <Grid Margin="0,8,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
                                         <ColumnDefinition Width="*"/>
@@ -2412,7 +2541,7 @@
                                                VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 <!-- Saturation slider -->
-                                <Grid Margin="0,10,0,6">
+                                <Grid Margin="0,8,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
                                         <ColumnDefinition Width="*"/>
@@ -2436,7 +2565,7 @@
                                                VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 <!-- Temperature slider -->
-                                <Grid Margin="0,10,0,6">
+                                <Grid Margin="0,8,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
                                         <ColumnDefinition Width="*"/>
@@ -2460,7 +2589,7 @@
                                                VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 <!-- Black Level slider -->
-                                <Grid Margin="0,10,0,6">
+                                <Grid Margin="0,8,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
                                         <ColumnDefinition Width="*"/>
@@ -2484,7 +2613,7 @@
                                                VerticalAlignment="Center" Margin="8,0,0,0"/>
                                 </Grid>
                                 <!-- Gamma slider -->
-                                <Grid Margin="0,10,0,6">
+                                <Grid Margin="0,8,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="SliderLabel"/>
                                         <ColumnDefinition Width="*"/>

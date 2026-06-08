@@ -48,6 +48,9 @@ copy /y "%HOOK_DIR%\S4W_Hook.dll"               "%DIST_DIR%\Hook\S4W_Hook.dll"
 copy /y "%HOOK_DIR%\S4W_Hook_x86.dll"           "%DIST_DIR%\Hook\S4W_Hook_x86.dll"
 copy /y "%HOOK_DIR%\S4W_Injector_x86.exe"       "%DIST_DIR%\Hook\S4W_Injector_x86.exe"
 
+mkdir "%DIST_DIR%\Bezels"
+if exist "%PROJ_DIR%\Bezels\" xcopy /s /y /q "%PROJ_DIR%\Bezels\*" "%DIST_DIR%\Bezels\" >nul 2>&1
+
 :: Cleanup temp publish folder
 rmdir /s /q "%PROJ_DIR%\dist_tmp"
 

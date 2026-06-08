@@ -1,31 +1,51 @@
-# Build output
+# ───────────────────────────── Build output ─────────────────────────────
 bin/
 obj/
+dist_tmp/
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
 
-# IDE / Visual Studio
+# ───────────────────────── IDE / tooling / local ────────────────────────
 .vs/
+.vscode/
 *.user
 *.suo
 *.cache
+.claude/          # local Claude Code config (paths, settings) — never publish
 
-# OS files
-Thumbs.db
-Desktop.ini
-.DS_Store
-
-# Compile artifacts
-*.obj
-*.pdb
+# ──────────────────────────── Logs / debug ──────────────────────────────
 *.log
-
-# Hook compile logs
+debug/
+Hook/debug/
 Hook/compile_*.txt
 Hook/nul
 
-# Backup files
+# ───────────────────────────── Backups ──────────────────────────────────
 *.bak
 *.s4w
+_BACKUP*/
+*_backup*/
+*checkpoint*/
 
-# Photoshop / Illustrator source files
+# ───────────────── Large / generated assets (not source) ────────────────
+# Bezel PNGs are NOT shipped in the repo (size + third-party art). The build
+# recreates an empty Bezels/ folder; drop your own bezel PNGs here locally.
+Bezels/
 *.psd
 *.ai
+
+# Loose screenshots / binary docs (keep the repo lean)
+Megabezel screen*.png
+Megabezel screen*.jpg
+*.pdf
+*.docx
+
+# ──────────────────────────── OS files ──────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store

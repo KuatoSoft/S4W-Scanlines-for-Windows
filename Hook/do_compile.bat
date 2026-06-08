@@ -8,7 +8,7 @@ set SDKINC=D:\Windows Kits\10\Include\10.0.22621.0
   /I"%SDKINC%\um" /I"%SDKINC%\shared" /I"%SDKINC%\ucrt" ^
   "D:\S4W 1.1\Hook\S4W_Hook.cpp" ^
   /Fe:"D:\S4W 1.1\Hook\S4W_Hook.dll" ^
-  /link d3d11.lib d3d9.lib dxgi.lib d3dcompiler.lib user32.lib ole32.lib opengl32.lib gdi32.lib ^
+  /link d3d11.lib d3d9.lib dxgi.lib d3dcompiler.lib user32.lib ole32.lib opengl32.lib gdi32.lib psapi.lib ^
   /LIBPATH:"%SDK%\um\x64" ^
   /LIBPATH:"%MSVC%\lib\x64" ^
   /LIBPATH:"%SDK%\ucrt\x64" ^
@@ -20,7 +20,7 @@ if errorlevel 1 (echo COMPILE_FAIL) else (echo COMPILE_OK)
   /I"%SDKINC%\um" /I"%SDKINC%\shared" /I"%SDKINC%\ucrt" ^
   "D:\S4W 1.1\Hook\S4W_Hook.cpp" ^
   /Fe:"D:\S4W 1.1\Hook\S4W_Hook_x86.dll" ^
-  /link d3d11.lib d3d9.lib dxgi.lib d3dcompiler.lib user32.lib ole32.lib opengl32.lib gdi32.lib ^
+  /link d3d11.lib d3d9.lib dxgi.lib d3dcompiler.lib user32.lib ole32.lib opengl32.lib gdi32.lib psapi.lib ^
   /LIBPATH:"%SDK%\um\x86" ^
   /LIBPATH:"%MSVC%\lib\x86" ^
   /LIBPATH:"%SDK%\ucrt\x86" ^

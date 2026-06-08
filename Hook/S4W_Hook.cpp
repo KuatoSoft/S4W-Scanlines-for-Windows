@@ -18,7 +18,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <d3d11.h>
+#include <d3d11on12.h>   // D3D11-on-D3D12 interop (D3D12 game support)
+#include <d3d12.h>       // ID3D12Device / ID3D12CommandQueue (queue capture)
+#include <dxgi1_4.h>     // IDXGISwapChain3::GetCurrentBackBufferIndex (D3D12)
 #include <d3d9.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -29,13 +33,16 @@
 #include <cstdarg>
 #include <gl/GL.h>
 #include <d2d1.h>
+#include <d2d1_1.h>     // ID2D1DeviceContext — format-robust OSD on D3D12 backbuffer
 #include <dwrite.h>
+#include <wincodec.h>   // WIC for bezel PNG decoding
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 
@@ -81,6 +88,25 @@ struct SharedMem {
     wchar_t osdText[128];                          // UTF-16 text (null-terminated)
     // ── Borderless fullscreen request (offset 424) ──
     int    borderlessEnabled;                      // 1 = request SDL2 borderless windowed fullscreen
+    // ── MegaBezel reflection (offset 428) ──
+    // Mirror reflection of game edges into the border zone surrounding the image.
+    // Independent of bezel-art toggle. Zero-cost when megaBezelEnabled = 0.
+    float  megaBezelEnabled;                       // 1.0 = on, 0.0 = off
+    float  megaBezelThickness;                     // 0.0–1.0 → reflection zone width (max 10% per side)
+    float  megaBezelOpacity;                       // 0.0–1.0 → reflection brightness/visibility
+    float  megaBezelBlur;                          // 0.0–1.0 → blur strength applied to reflection samples
+    float  megaBezelRadius;                        // 0.0–1.0 → corner radius of inner viewport (0 = sharp 45° miter)
+    // ── Bezel PNG render-in-hook block (offset 448) ──
+    // When set, the hook loads the PNG itself and composites it under the
+    // reflection so the reflection appears ON TOP of the bezel art.
+    // The C# overlay window hides its bezel image while this is active.
+    float  bezelHookActive;                        // 1.0 = hook renders bezel, 0 = overlay does
+    float  bezelHookOpacity;                       // 0.0–1.0 → bezel image alpha multiplier
+    wchar_t bezelHookPath[260];                    // UTF-16 path (520 bytes) — empty = unload
+    // ── Reflection width (offset 976) ──
+    // Independent of megaBezelThickness (which sizes the bezel zone itself).
+    // 0.0–1.0 = fraction of the bezel zone the reflection actually fills.
+    float  megaBezelReflectionWidth;               // 0.0–1.0 → reflection extent within bezel zone
 };
 #pragma pack(pop)
 
@@ -117,8 +143,18 @@ struct ScanlineCBData {
     float tapeNoiseEnabled;
     float tapeNoiseIntensity;                       // row 9
     float vignetteEnabled;
-    float _cbpad1;
-    float _cbpad2;
+    float megaBezelEnabled;
+    float megaBezelThickness;
+    float megaBezelOpacity;                          // row 10
+    float megaBezelBlur;
+    float bezelHookActive;
+    float bezelHookOpacity;
+    float megaBezelRadius;                           // row 11
+    float megaBezelReflectionWidth;
+    float megaBezelStartFade;                        // 0.0–1.0 — startup fade-in to mask any
+                                                     // initial clear-color/splash visible in the
+                                                     // bezel reflection during the first ~1.5s.
+    float _cbpad3;
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -164,11 +200,102 @@ static ID3D11RasterizerState* g_Raster  = nullptr;
 static ID3D11Texture2D*     g_BBCopy    = nullptr;   // backbuffer copy for blur sampling
 static ID3D11ShaderResourceView* g_BBSRV = nullptr;
 static ID3D11SamplerState*  g_Sampler   = nullptr;
+// Bezel PNG cached texture (loaded by hook from path in shared mem)
+static ID3D11Texture2D*           g_BezelTex  = nullptr;
+static ID3D11ShaderResourceView*  g_BezelSRV  = nullptr;
+static ID3D11SamplerState*        g_BezelSamp = nullptr;
+static wchar_t                    g_BezelPathCached[260] = {};
 static UINT                 g_LastBBW = 0, g_LastBBH = 0;
 static bool              g_Inited       = false;
 static HANDLE            g_MapFile      = nullptr;
 static SharedMem*        g_Shared       = nullptr;
 static HMODULE           g_Module       = nullptr;
+
+// ══════════════════════════════════════════════════════════════════════════
+//  D3D12 PARALLEL PATH (via D3D11On12) — ISOLATED, ZERO IMPACT ON D3D11/9/GL
+// ──────────────────────────────────────────────────────────────────────────
+//  D3D12 games (e.g. Mina the Hollower) share the DXGI swap-chain Present with
+//  D3D11, so our existing Present hook FIRES — but sc->GetDevice(ID3D11Device)
+//  returns E_NOINTERFACE because the real device is D3D12. We detect this and
+//  switch to a parallel pipeline: create a D3D11 device GRAFTED onto the game's
+//  D3D12 device (D3D11On12CreateDevice), wrap the D3D12 back buffer as a D3D11
+//  texture, and run the EXACT SAME HLSL shader pipeline as the native D3D11
+//  path. No shader rewrite. All entry points are loaded dynamically so the DLL
+//  gains no static dependency on d3d12.dll — non-D3D12 games are untouched.
+// ──────────────────────────────────────────────────────────────────────────
+// g_GfxApi: 0 = unknown (probe), 11 = native D3D11, 12 = D3D12-on-11.
+static int               g_GfxApi       = 0;
+static bool              g_Inited12     = false;
+// Dynamically-loaded creation entry points (no d3d12.lib import).
+typedef HRESULT (WINAPI *PFN_D3D12_CREATE_DEVICE)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+typedef HRESULT (WINAPI *PFN_D3D11ON12_CREATE_DEVICE)(IUnknown*, UINT,
+    const D3D_FEATURE_LEVEL*, UINT, IUnknown* const*, UINT, UINT,
+    ID3D11Device**, ID3D11DeviceContext**, D3D_FEATURE_LEVEL*);
+// Game objects we attach to.
+static ID3D12Device*        g_D3D12Device  = nullptr;   // game's D3D12 device (from swapchain)
+static ID3D12CommandQueue*  g_GameCmdQueue = nullptr;   // captured via ExecuteCommandLists hook
+static IDXGISwapChain3*     g_SC3          = nullptr;   // for GetCurrentBackBufferIndex
+// D3D11On12 device + our shader resources (mirror of the native-D3D11 set).
+static ID3D11On12Device*    g_On12         = nullptr;
+static ID3D11Device*        g_Dev11on12    = nullptr;
+static ID3D11DeviceContext* g_Ctx11on12    = nullptr;
+static ID3D11VertexShader*  g_VS12         = nullptr;
+static ID3D11PixelShader*   g_PS12         = nullptr;
+static ID3D11Buffer*        g_CB12         = nullptr;
+static ID3D11BlendState*    g_Blend12      = nullptr;
+static ID3D11BlendState*    g_BlendOver12  = nullptr;
+static ID3D11SamplerState*  g_Sampler12    = nullptr;
+static ID3D11SamplerState*  g_BezelSamp12  = nullptr;
+static ID3D11RasterizerState* g_Raster12   = nullptr;
+static ID3D11Texture2D*     g_BBCopy12     = nullptr;   // backbuffer copy for blur/bloom/etc.
+static ID3D11ShaderResourceView* g_BBSRV12 = nullptr;
+static UINT                 g_LastBBW12 = 0, g_LastBBH12 = 0;
+static ID3D11Texture2D*           g_BezelTex12 = nullptr;
+static ID3D11ShaderResourceView*  g_BezelSRV12 = nullptr;
+static wchar_t                    g_BezelPathCached12[260] = {};
+// ExecuteCommandLists vtable hook (captures the game's DIRECT command queue).
+typedef void (STDMETHODCALLTYPE *PFN_ExecuteCommandLists)(
+    ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+static PFN_ExecuteCommandLists g_OrigECL       = nullptr;
+static void**                  g_ECLVtableSlot = nullptr;   // &vtable[10], for auto-unhook
+static bool                    g_D3D12QueueHookInstalled = false;
+// D2D 1.1 device context for OSD text on the D3D12 back buffer (format-robust).
+// Non-fatal: if any of these fail to create, effects still work, OSD is skipped.
+static ID2D1Factory1*      g_D2DFactory12 = nullptr;
+static ID2D1Device*        g_D2DDevice12  = nullptr;
+static ID2D1DeviceContext* g_D2DCtx12     = nullptr;
+
+// ── GOPHER PARALLEL PATH FLAG ───────────────────────────────────────────
+// Set at DllMain (before HookThread starts) when the host exe name is in the
+// Gopher64 family. When TRUE, HookThread TAKES A COMPLETELY DIFFERENT CODE
+// PATH — none of the D3D11/D3D9/OpenGL/DDraw/GDI main hooks are installed.
+// When FALSE, HookThread is byte-for-byte identical to v1.2 behavior. This
+// flag is the ONLY point where the Gopher code touches anything in this file
+// outside the dedicated Gopher block.
+static bool              g_IsGopher     = false;
+
+// ── MAME PARALLEL PATH FLAG ─────────────────────────────────────────────
+// Set at DllMain when the host exe is a MAME binary (mame.exe, mame64.exe,
+// mame0270.exe, etc.).  When TRUE:
+//   - HookedD3D9CreateDevice/Ex become PERMANENT (restore-call-repatch) and
+//     call D3D9ReleaseOurResources() before the real call so MAME can create
+//     its new exclusive-fullscreen device without hitting D3DERR_INVALIDCALL.
+//   - The permanent hooks are also installed in the D3D9 SUCCESS path (not
+//     just the fallback path).
+// When FALSE: CreateDevice hooks remain one-shot deferred fallbacks — v1.2
+// behavior, every other D3D9 game is completely unaffected.
+static bool              g_IsMame       = false;
+
+// ── MMF2 (CLICKTEAM) FLAG ──────────────────────────────────────────────
+// Set at DllMain when the process has mmfs2.dll loaded (Clickteam Multimedia
+// Fusion 2 runtime).  MMF2 games call IDirect3DDevice9::Reset multiple times
+// per level transition, causing redundant shader recompilation (~2.5s each).
+// When TRUE: the compiled ps_3_0 bytecode is cached in g_D3D9PSCachedBlob
+// and reused across Resets instead of recompiling from source every time.
+// When FALSE: every Reset recompiles from source — v1.2 behavior, every
+// other D3D9 game is completely unaffected.
+static bool              g_IsMMF2       = false;
+static ID3DBlob*         g_D3D9PSCachedBlob = nullptr;
 
 // ── D2D1 / DirectWrite for OSD text overlay ─────────────────────────────
 static ID2D1Factory*         g_D2DFactory   = nullptr;
@@ -189,6 +316,20 @@ static float GetTimeSeconds() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (float)((double)(now.QuadPart - g_PerfStart.QuadPart) / (double)g_PerfFreq.QuadPart);
+}
+
+// MegaBezel startup fade-in (0 → 1 over 1.5s after megabezel first turns on).
+// Masks any initial clear-color flash (vivid blue splash, skybox, etc.) the
+// game might render in its first frames before real content appears — without
+// this, the reflection mirrors the splash and looks unprofessional. Toggling
+// off then on again after game launch returns to full opacity immediately
+// (firstActive remains set, so saturation kicks in).
+static float GetMegaBezelStartFade(bool active) {
+    static float firstActive = -1.0f;
+    if (!active) return 0.0f;
+    if (firstActive < 0.0f) firstActive = GetTimeSeconds();
+    float t = (GetTimeSeconds() - firstActive) / 1.5f;
+    return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -231,6 +372,16 @@ static void LogInit() {
         CreateDirectoryW(path, nullptr);
         wcscat_s(path, MAX_PATH, L"\\S4W_Hook_");
         wcscat_s(path, MAX_PATH, baseName);
+        // Gopher64: launcher + child renderer share the same exe name.
+        // fopen("a") holds a write-lock on Windows — the second process (child)
+        // would get access denied and produce no logs. Add PID to the filename
+        // so every Gopher process gets its own unique log file.
+        if (_wcsicmp(baseName, L"gopher64-windows-x86_64") == 0 ||
+            _wcsicmp(baseName, L"gopher64") == 0) {
+            wchar_t pidBuf[32] = {};
+            swprintf_s(pidBuf, 32, L"_%lu", GetCurrentProcessId());
+            wcscat_s(path, MAX_PATH, pidBuf);
+        }
         wcscat_s(path, MAX_PATH, L"_Log.txt");
     }
     if (!path[0])
@@ -328,9 +479,16 @@ VS_OUT main(uint id : SV_VertexID) {
 )";
 
 // ── HLSL Pixel Shader — CRT scanline mask + optional Gaussian blur ───────
+//
+// MEGABEZEL_REFLECTION_FADE: 1 = smooth quadratic falloff of the reflection
+//   from the game edge to the configured reflection width, 0 = hard cut at
+//   the configured width (no fade). Recompile the hook DLL after changing.
 static const char* PS_SRC = R"(
-Texture2D    g_Tex  : register(t0);
-SamplerState g_Samp : register(s0);
+#define MEGABEZEL_REFLECTION_FADE 1
+Texture2D    g_Tex      : register(t0);
+SamplerState g_Samp     : register(s0);
+Texture2D    g_BezelTex : register(t1);
+SamplerState g_BezelSamp: register(s1);
 
 cbuffer CB : register(b0) {
     float screenW, screenH, hThickness, hGap;
@@ -363,8 +521,16 @@ cbuffer CB : register(b0) {
     float tapeNoiseEnabled;
     float tapeNoiseIntensity;
     float vignetteEnabled;
-    float _cbpad1;
-    float _cbpad2;
+    float megaBezelEnabled;
+    float megaBezelThickness;
+    float megaBezelOpacity;
+    float megaBezelBlur;
+    float bezelHookActive;
+    float bezelHookOpacity;
+    float megaBezelRadius;
+    float megaBezelReflectionWidth;
+    float megaBezelStartFade;
+    float _cbpad3;
 };
 
 // Tape Noise helper functions (ported from libretro static.glsl)
@@ -421,24 +587,284 @@ float scanlineIntensity(float pos, float thickness, float gap, float opacity, fl
 }
 
 // Barrel distortion — simulates CRT curved glass
+// r² = x² + y² (uniform spherical bowl) is the only formula that produces
+// equal arc ratios on all four edges regardless of aspect ratio:
+//   Δr²_right = β = 1  (y goes 0→1 along right edge)
+//   Δr²_top   = α = 1  (x goes 0→1 along top  edge)  ← identical ✓
+// Any α≠β skews one pair of edges, making them appear flatter or more curved.
 float2 CurveUV(float2 uv, float strength) {
     float2 cc = uv * 2.0 - 1.0;
     cc *= 1.0 + strength * dot(cc, cc);
     return cc * 0.5 + 0.5;
 }
+)";
 
+// ── HLSL Pixel Shader part 2 (main function) — split to stay within MSVC
+//    string-literal size limit (65535 bytes per token).
+static const char* PS_SRC2 = R"(
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    // ── Curvature: barrel-distort UV, black outside screen edge ──
+    // ── Curvature + MegaBezel: barrel-distort UV, reflection in border ──
     // Scanlines stay in screen-space (pos.xy) — never warp them with barrel
     // distortion, otherwise the periodic grid creates Moiré interference rings.
     float2 sampleUV = uv;
     bool curved = curvatureEnabled >= 0.5 && curvatureIntensity > 0.0;
-    if (curved) {
+    bool megaBz = megaBezelEnabled >= 0.5;
+    // MegaBezel ON: ALWAYS shrink first so the resize slider always controls
+    // the visible game viewport size, even when curvature is active. Curvature
+    // (if on) is then applied INSIDE the shrunken viewport.
+    // MegaBezel OFF + curvature ON: classic full-screen curvature (no shrink).
+    if (megaBz) {
+        float margin = megaBezelThickness * 0.10;  // max 10% per side
+        if (margin < 0.001) margin = 0.001;
+        sampleUV.x = (uv.x - margin) / (1.0 - 2.0 * margin);
+        sampleUV.y = (uv.y - margin) / (1.0 - 2.0 * margin);
+        if (curved) {
+            sampleUV = CurveUV(sampleUV, curvatureIntensity * 0.25);
+        }
+    } else if (curved) {
         sampleUV = CurveUV(uv, curvatureIntensity * 0.25);
-        if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
-            return float4(0, 0, 0, 1);
     }
 
+    // Rounded-rect SDF for the inner game viewport — computed in sampleUV space
+    // so it works identically for non-curvature mode (sampleUV from margin shrink)
+    // AND curvature mode (sampleUV from barrel distortion). The radius rounds
+    // the visible corners of the game in BOTH modes.
+    // REFL. RADIUS (megaBezelRadius) — rounds the reflection's INNER corner so it
+    // hugs a rounded CRT bezel PNG. 0 = square inner corner (original look);
+    // higher rounds the corner and lets the reflection overflow INWARD over the
+    // game corner (wanted, to match a rounded bezel). Fully INDEPENDENT of GAME
+    // CORNERS (vignetteEnabled), which only rounds the in-game black mask below.
+    float  mbR        = megaBezelRadius * 0.025;
+    float2 mbCV       = sampleUV - 0.5;
+    float2 mbHalfExt  = float2(0.5, 0.5);              // game = [0,1] in sampleUV
+    float2 mbQ        = abs(mbCV) - mbHalfExt + mbR;
+    float  mbSDF      = length(max(mbQ, 0.0)) + min(max(mbQ.x, mbQ.y), 0.0) - mbR;
+
+    // Reflection boundary = SQUARE viewport → clean 45° miter corners, NO radial
+    // fan, NO overflow. The GAME's corners are rounded separately below (REFL.
+    // RADIUS hard-mask) so the reflection stays clean and the game tucks under the
+    // bezel — the only artifact-free way to match a rounded CRT bezel.
+    bool outsideGame = megaBz ? (mbSDF > 0.0)
+                    : (sampleUV.x < 0.0 || sampleUV.x > 1.0
+                    || sampleUV.y < 0.0 || sampleUV.y > 1.0);
+
+    if (outsideGame) {
+        if (megaBz) {
+            // ── Picture-frame mirror reflection ──
+            // Sides: 45 deg miter (clean diagonal at corners — like a wood frame).
+            // Rounded corners: radial mirror across the arc, smooth and seamless.
+            float2 mUV;
+            float bezelDepth;
+            // ── Compute side (45° miter) reflection ──
+            float depthX = sampleUV.x < 0.0 ? -sampleUV.x
+                         : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;
+            float depthY = sampleUV.y < 0.0 ? -sampleUV.y
+                         : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;
+            bool sInSide = depthX > 0.0;
+            bool sInTopBot = depthY > 0.0;
+            float2 mUV_side;
+            if (sInSide && sInTopBot) {
+                if (depthX >= depthY) {
+                    mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;
+                    mUV_side.y = saturate(sampleUV.y);
+                } else {
+                    mUV_side.x = saturate(sampleUV.x);
+                    mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;
+                }
+            } else if (sInSide) {
+                mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;
+                mUV_side.y = saturate(sampleUV.y);
+            } else {
+                mUV_side.x = saturate(sampleUV.x);
+                mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;
+            }
+            float bezelDepth_side = max(depthX, depthY);
+
+            // ── Compute corner (radial through arc) reflection ──
+            float2 arcCenter = sign(mbCV) * (mbHalfExt - mbR);
+            float2 u         = mbCV - arcCenter;
+            float  distU     = max(length(u), 1e-5);
+            float2 mCV       = arcCenter + u * (2.0 * mbR - distU) / distU;
+            float2 mUV_corner = mCV + 0.5;
+            float bezelDepth_corner = max(distU - mbR, 0.0);
+
+            // Smoothly blend between side and corner reflections to avoid the
+            // visible seam at the boundary (mbQ.x=0 or mbQ.y=0). The blend region
+            // is mbR wide; deep in the corner we fully use the radial method,
+            // along the sides we fully use the miter, with a smooth transition.
+            // Pure 45° miter (radial corner mirror disabled — it caused the
+            // "peacock fan" artifact on bright game-corner content).
+            float blendCorner = 0.0;
+            bezelDepth = lerp(bezelDepth_side, bezelDepth_corner, blendCorner);
+            // ── Per-axis mirror across the ROUNDED game edge (radius mbR = REFL. RADIUS) ──
+            // Mirror each axis across the rounded-edge position (arc in the corner,
+            // straight elsewhere). The 45-deg split fills the rounded-off corner with the
+            // two side reflections meeting at the diagonal — axis-aligned, NO radial fan.
+            float2 cR    = sampleUV - 0.5;
+            float2 sgnR  = sign(cR);
+            float2 aR    = abs(cR);
+            float  arcCo = 0.5 - mbR;
+            float  xEdge = (aR.y > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.y-arcCo)*(aR.y-arcCo), 0.0))) : 0.5;
+            float  yEdge = (aR.x > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.x-arcCo)*(aR.x-arcCo), 0.0))) : 0.5;
+            float  depthXr = aR.x - xEdge;
+            float  depthYr = aR.y - yEdge;
+            float2 aM_X   = float2(2.0*xEdge - aR.x, aR.y);
+            float2 aM_Y   = float2(aR.x, 2.0*yEdge - aR.y);
+            float  blendW = max(mbR * 0.6, 1e-4);          // soft diagonal blend (tunable: bigger = smoother)
+            float2 aM     = lerp(aM_Y, aM_X, smoothstep(-blendW, blendW, depthXr - depthYr));
+            mUV = saturate(0.5 + sgnR * aM);
+            // Letterbox inset: crops intrinsic top/bottom black bars from the
+            // reflection, but ONLY on top/bottom reflections. Side (L/R) reflections
+            // keep mUV.y = sampleUV.y so content stays vertically aligned with the
+            // game. insetW blends side(0)<->top/bottom(1), no corner seam.
+            const float yLetterboxInset = 0.02;
+            float insetW = 1.0 - smoothstep(-blendW, blendW, depthXr - depthYr);
+            mUV.y = lerp(mUV.y, yLetterboxInset + mUV.y * (1.0 - 2.0 * yLetterboxInset), insetW);
+            // 7x7 Gaussian blur (49 taps), texel-spaced — wide smooth blur
+            // without ghosting. Sigma scales BOTH spread and weight falloff.
+            float sigma = megaBezelBlur * 5.0 + 0.0001;
+            float2 texel = 1.0 / float2(screenW, screenH);
+            float3 reflColor;
+            if (sigma > 0.05) {
+                float3 sum = float3(0, 0, 0);
+                float  wSum = 0.0;
+                [unroll] for (int dy = -3; dy <= 3; dy++) {
+                    [unroll] for (int dx = -3; dx <= 3; dx++) {
+                        float d2 = float(dx*dx + dy*dy);
+                        float w  = exp(-d2 / (2.0 * sigma * sigma));
+                        sum  += g_Tex.Sample(g_Samp, saturate(mUV + float2(dx, dy) * texel * sigma)).rgb * w;
+                        wSum += w;
+                    }
+                }
+                reflColor = sum / wSum;
+            } else {
+                reflColor = g_Tex.Sample(g_Samp, mUV).rgb;
+            }
+            // ── Reflection width + fade (CURVED-DEPTH per-axis, miter-aligned) ──
+            //
+            // Both the mirror miter (the sharp 45° seam where side and top/bot
+            // mirrors meet at corners) and the fade contour use the SAME depth
+            // metric: per-axis distance OUTSIDE [0,1]² in the curved sampleUV
+            // space. They share the same comparison (depthX vs depthY in curved
+            // sampleUV), so the fade boundary cleanly follows the miter line on
+            // all 4 corners.
+            //
+            // Per-axis normalization uses the curved depth at the SCREEN EDGE
+            // for the current pixel's row/column — computed by re-running
+            // CurveUV on synthetic edge positions (uv.x=0, uv.x=1, uv.y=0,
+            // uv.y=1, same other axis). This gives:
+            //
+            //   • Slider 100% reaches the physical screen edge on all 4 sides,
+            //     curvature ON or OFF.
+            //   • Without curvature, CurveUV() is the identity → math is
+            //     mathematically identical to the original (pre-changes)
+            //     behavior — clean 45° miter restored.
+            //   • With curvature, the fade covers the FULL visible bezel zone
+            //     (from the curved game edge to the screen edge), so no
+            //     full-opacity "plateau" between game edge and uv=margin.
+            //   • Top↔bottom symmetric (CurveUV is symmetric around 0.5).
+            //   • Miter and fade contour both pass through uv.x == uv.y at
+            //     corners (by curvature's diagonal symmetry).
+            float marginRef     = max(megaBezelThickness * 0.10, 0.001);
+            float gameWpx       = max(screenW * (1.0 - 2.0 * marginRef), 1.0);
+            float gameHpx       = max(screenH * (1.0 - 2.0 * marginRef), 1.0);
+            float reflW         = max(megaBezelReflectionWidth, 0.001);
+            float invShrink     = 1.0 / max(1.0 - 2.0 * marginRef, 1e-5);
+            float curvStrength  = curved ? curvatureIntensity * 0.25 : 0.0;
+
+            // Synthetic pre-margin sampleUV at each screen edge for current row/col.
+            float2 sUV_left  = float2((0.0 - marginRef) * invShrink,
+                                       (uv.y - marginRef) * invShrink);
+            float2 sUV_right = float2((1.0 - marginRef) * invShrink,
+                                       (uv.y - marginRef) * invShrink);
+            float2 sUV_top   = float2((uv.x - marginRef) * invShrink,
+                                       (0.0 - marginRef) * invShrink);
+            float2 sUV_bot   = float2((uv.x - marginRef) * invShrink,
+                                       (1.0 - marginRef) * invShrink);
+            // Apply curvature (identity if curved=false → CurveUV w/ strength=0).
+            float2 csu_left  = curved ? CurveUV(sUV_left,  curvStrength) : sUV_left;
+            float2 csu_right = curved ? CurveUV(sUV_right, curvStrength) : sUV_right;
+            float2 csu_top   = curved ? CurveUV(sUV_top,   curvStrength) : sUV_top;
+            float2 csu_bot   = curved ? CurveUV(sUV_bot,   curvStrength) : sUV_bot;
+
+            // Current pixel's curved per-axis depth from game edge.
+            float depthXc = sampleUV.x < 0.0 ? -sampleUV.x
+                          : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;
+            float depthYc = sampleUV.y < 0.0 ? -sampleUV.y
+                          : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;
+
+            // Per-axis curved depth at the screen edge in the same row/col.
+            // Branch on which side the current pixel is (left vs right, top vs bot)
+            // so each axis normalizes against its own physical screen edge.
+            float maxDepthX = sampleUV.x < 0.0 ? -csu_left.x
+                            : sampleUV.x > 1.0 ? csu_right.x - 1.0 : 1.0;
+            float maxDepthY = sampleUV.y < 0.0 ? -csu_top.y
+                            : sampleUV.y > 1.0 ? csu_bot.y - 1.0 : 1.0;
+
+            // Aspect-correction scale on the SHORTER bezel-zone axis so the
+            // fade rate (in screen pixels per unit fade) matches the LONGER
+            // axis. Without this, on a 16:9 screen the top/bottom 54-px bezel
+            // fades over 54 px while the 96-px sides fade over 96 px — the
+            // user perceives top/bottom as "more abrupt / cut short".
+            // With this, both axes fade at the same pixel rate; on the shorter
+            // axis the fade gradient extends past the screen edge and gets
+            // naturally clipped, leaving a brighter residual near the screen
+            // edge — exactly the user's "augmenter la distance T/B" request.
+            // Side mirror region (where X depth dominates) is unaffected
+            // because dxN there is unchanged → L/R look stays identical.
+            float aspect = screenW / max(screenH, 1.0);
+            float xFadeScale = max(1.0 / aspect, 1.0);  // > 1 only on portrait
+            float yFadeScale = max(aspect, 1.0);        // > 1 only on landscape
+
+            // Per-axis fade (miter-style) — the radius only shapes the game
+            // boundary (outsideGame) and the sampling coordinate (mUV blend);
+            // the fade gradient always follows 45° diagonals regardless of
+            // radius, keeping the reflection unified with no corner seams.
+            // Corner reflection fade follows the ARC (radial distance from the
+            // rounded game corner), mirrored from the D3D9 path so the reflection
+            // hugs the rounded corner instead of the square viewport. Sides keep
+            // the 45° miter fade; blendCorner cross-fades between them.
+            float2 dirCorn  = u / max(distU, 1e-5);
+            float corMaxX   = (maxDepthX + mbR) / max(abs(dirCorn.x), 0.01);
+            float corMaxY   = (maxDepthY + mbR) / max(abs(dirCorn.y), 0.01);
+            float corMaxRef = max(min(corMaxX, corMaxY) - mbR, 1e-5);
+            float normDepth_corner = saturate(bezelDepth_corner / max(corMaxRef * reflW, 1e-5));
+            float dxN = depthXc / max(maxDepthX * xFadeScale, 1e-5);
+            float dyN = depthYc / max(maxDepthY * yFadeScale, 1e-5);
+            float normDepth_side = saturate(max(dxN, dyN) / reflW);
+            float normDepth = lerp(normDepth_side, normDepth_corner, blendCorner);
+        #if MEGABEZEL_REFLECTION_FADE
+            // Smooth quadratic falloff: 1.0 at the game edge → 0.0 at reflPx.
+            float fade = 1.0 - normDepth;
+            fade = fade * fade;
+        #else
+            // Hard cut: full reflection inside reflPx, nothing beyond.
+            float fade = step(normDepth, 1.0);
+        #endif
+            // Startup fade-in masks any initial clear-color flash (e.g. a vivid
+            // blue splash or skybox) the game shows in its first frames — the
+            // reflection ramps up from 0 over ~1.5s instead of mirroring it
+            // straight away.
+            float startFade = saturate(megaBezelStartFade);
+            float3 reflected = reflColor * megaBezelOpacity * fade * startFade;
+            // Composite reflection ON TOP of bezel PNG when hook owns the
+            // bezel rendering. Standard "over" operator: bezel is the
+            // background, reflection is the foreground at megaBezelOpacity*fade.
+            if (bezelHookActive >= 0.5) {
+                float4 bz = g_BezelTex.Sample(g_BezelSamp, uv);
+                bz.rgb *= bezelHookOpacity;
+                float ra = megaBezelOpacity * fade * startFade;
+                return float4(reflected + bz.rgb * bz.a * (1.0 - ra), 1.0);
+            }
+            return float4(reflected, 1.0);
+        }
+        // Curvature with no MegaBezel: black outside (matches v1.2 behavior).
+        if (curved) return float4(0, 0, 0, 1);
+    }
+)";
+
+// PS_SRC2b: remainder of pixel shader main() — split to stay under MSVC limit.
+static const char* PS_SRC2b = R"(
     float mask = 1.0;
     // Pixel footprint in screen-space — constant ~1.0, used for smooth scanline edges
     float fwY = fwidth(pos.y);
@@ -456,23 +882,24 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             mask *= scanlineIntensity(pos.x, vThickness, vGap, vOpacity, fwX);
     }
 
-    bool needTex = blurEnabled >= 0.5 || bloomEnabled >= 0.5 || curved
+    bool needTex = blurEnabled >= 0.5 || bloomEnabled >= 0.5 || curved || megaBz
                 || flickerEnabled >= 0.5 || phosphorEnabled >= 0.5
                 || abs(brightness) > 0.001 || abs(contrast) > 0.001
                 || abs(saturation) > 0.001 || abs(temperature) > 0.001
                 || blackLevel > 0.001 || abs(gamma - 1.0) > 0.001
                 || vhsEnabled >= 0.5 || grainIntensity > 0.001
-                || tapeNoiseEnabled >= 0.5 || vignetteEnabled >= 0.5;
+                || tapeNoiseEnabled >= 0.5 || vignetteEnabled > 0.0
+                || bezelHookActive >= 0.5;
     if (!needTex) {
-        if (vignetteEnabled >= 0.5) {
-            float  r    = 0.04;
+        if (vignetteEnabled > 0.0) {
+            float  r    = max(vignetteEnabled * 0.10, 0.022);  // radius floored at fade width so the fade hugs the edge at all settings (gradient unchanged)
             float2 qv   = abs(uv - 0.5) - 0.5 + r;
             float  rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;
             float2 outN;
             if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);
             else if (qv.x > 0.0)          outN = float2(1.0, 0.0);
             else                           outN = float2(0.0, 1.0);
-            float fadeW = length(float2(outN.x * 0.012, outN.y * 0.033));
+            float fadeW = length(float2(outN.x * 0.008, outN.y * 0.020));
             mask *= smoothstep(0.0, fadeW, -rSDF);
         }
         return float4(mask, mask, mask, 1.0);
@@ -480,8 +907,19 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
     float2 texel = 1.0 / float2(screenW, screenH);
 
+    // NOTE: previous versions cropped 2% off the game's top/bottom here to hide
+    // the game's intrinsic letterbox. That hardcoded crop also stretched games
+    // WITHOUT letterbox, eating HUD pixels. Removed: the game is now sampled
+    // unstretched at its original aspect ratio. The reflection mirror still
+    // uses its own 2% inset (mUV remap) so it samples real game art.
+
     // Sample game frame at (distorted) UV
     float4 color = g_Tex.Sample(g_Samp, sampleUV);
+    // Raw source luminance — saved BEFORE any processing so it reflects the
+    // original game pixel value.  Used as a content mask: perfectly-black
+    // letterbox bars have rawSourceLuma≈0 and get tape-noise/VHS suppressed,
+    // while actual game pixels (even dark ones) have enough luma to pass through.
+    float rawSourceLuma = dot(color.rgb, float3(0.299, 0.587, 0.114));
 
     // Gaussian blur (must run before B/C/S/T — blur re-samples original texture)
     if (blurEnabled >= 0.5) {
@@ -588,6 +1026,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     if (vhsEnabled >= 0.5 && uv.y <= 0.96) {
         float inten = vhsIntensity;
         float t     = time;
+        // outsideGame follows curvature + MegaBezel resize boundary exactly.
+        // rawSourceLuma is a secondary gate for in-game letterbox bars.
+        float contentMask = outsideGame ? 0.0 : smoothstep(0.0, 0.015, rawSourceLuma);
 
         // — 1. LINE JITTER: sparse spike lines only (no global sinusoidal shift) —
         float lineIdx = floor(uv.y * 720.0);
@@ -601,18 +1042,18 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         float luma0  = dot(s0.rgb, float3(0.299, 0.587, 0.114));
         float chrMag = saturate(length(s0.rgb - luma0) * 2.5);
         float dotPhi = (uv.x * 240.0 + floor(t * 29.97) * 0.5) * 3.14159265;
-        output.r += sin(dotPhi)         * inten * 0.008 * chrMag;
-        output.b += sin(dotPhi + 1.047) * inten * 0.006 * chrMag;
+        output.r += sin(dotPhi)         * inten * 0.008 * chrMag * contentMask;
+        output.b += sin(dotPhi + 1.047) * inten * 0.006 * chrMag * contentMask;
 
         // — 4. LUMA NOISE: horizontal tape hiss streaks —
         float ny     = floor(uv.y * 200.0);
         float nx     = floor(uv.x * 15.0);
         float nt     = floor(t * 25.0);
         float streak = frac(sin(dot(float2(nx + ny * 200.0, nt), float2(127.1, 311.7))) * 43758.5) - 0.5;
-        output.rgb  += streak * inten * 0.022;
+        output.rgb  += streak * inten * 0.022 * contentMask;
 
         // — 5. HEAD-SWITCHING BAND: bottom ~3% of screen, mechanical artifact —
-        float headZone = smoothstep(0.97, 1.00, uv.y);
+        float headZone = smoothstep(0.97, 1.00, uv.y) * contentMask;
         float headH    = frac(sin(floor(uv.y * 300.0) * 127.1 + floor(t * 30.0) * 311.7) * 43758.5);
         float headOff  = (headH - 0.5) * inten * 0.030;
         float4 headS   = g_Tex.Sample(g_Samp, jUV + float2(headOff, 0.0));
@@ -620,37 +1061,35 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
         // — 6. COLOR GRADING: desaturation + luma lift + warm shadows —
         float vLuma = dot(output.rgb, float3(0.299, 0.587, 0.114));
-        output.rgb  = lerp(output.rgb, float3(vLuma, vLuma, vLuma), inten * 0.25);
-        output.rgb *= lerp(1.0, 1.06, inten);          // analog luma lift (like luminance=1.10)
-        output.r   += inten * 0.020 * (1.0 - vLuma);   // warm shadows
-        output.b   -= inten * 0.014 * (1.0 - vLuma);
+        output.rgb  = lerp(output.rgb, float3(vLuma, vLuma, vLuma), inten * 0.25 * contentMask);
+        output.rgb *= lerp(1.0, 1.06, inten * contentMask);               // analog luma lift
+        output.r   += inten * 0.020 * (1.0 - vLuma) * contentMask;        // warm shadows
+        output.b   -= inten * 0.014 * (1.0 - vLuma) * contentMask;        // cool shadows
         output      = saturate(output);
     }
 
-    // Film Grain — organic clumped grain (film-like, not digital noise)
+    // Film Grain — true per-pixel noise, hash without sine (no periodic banding)
     if (grainIntensity > 0.001) {
-        float  lum   = dot(output.rgb, float3(0.299, 0.587, 0.114));
-        float2 tOff  = floor(time * 24.0) * float2(17.0, 13.0);
-        // Coarse 2×2 px clusters for organic film look
-        float2 gc   = floor(pos.xy * 0.5 + tOff);
-        float  g0   = frac(sin(dot(gc,               float2(127.1, 311.7))) * 43758.5453) - 0.5;
-        float  g1   = frac(sin(dot(gc + float2(1,0), float2(311.7,  92.9))) * 43758.5453) - 0.5;
-        float  g2   = frac(sin(dot(gc + float2(0,1), float2( 92.9, 213.7))) * 43758.5453) - 0.5;
-        // Fine 1×1 px detail layer
-        float2 gf   = floor(pos.xy + tOff * 1.3);
-        float gFine = frac(sin(dot(gf, float2(213.7, 127.1))) * 43758.5453) - 0.5;
-        float grain = (g0 + g1 + g2) * 0.333 * 0.65 + gFine * 0.35;
-        // Midtone-weighted: strongest at lum=0.5, falls toward pure black/white
-        float amp   = 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0) * 0.55;
-        output.rgb += grain * grainIntensity * 0.22 * amp;
+        float contentMask = outsideGame ? 0.0 : smoothstep(0.0, 0.015, rawSourceLuma);
+        float lum   = dot(output.rgb, float3(0.299, 0.587, 0.114));
+        float3 p3   = frac(float3(pos.xy, floor(time * 24.0) + 1.0)
+                         * float3(0.1031, 0.1030, 0.0973));
+        p3         += dot(p3, p3.yzx + 33.33);
+        float grain = frac((p3.x + p3.y) * p3.z) * 2.0 - 1.0;
+        float amp   = 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0);
+        output.rgb += grain * grainIntensity * 0.18 * amp * contentMask;
         output      = saturate(output);
     }
 
     // Tape Noise — libretro-style analog tape interference spikes
+    // contentMask suppresses the effect on letterbox black bars (rawSourceLuma≈0).
+    // The smoothstep range [0, 0.015] is narrow enough that even dim game content
+    // gets full-strength noise; only perfectly-black pixels are excluded.
     if (tapeNoiseEnabled >= 0.5) {
+        float contentMask = outsideGame ? 0.0 : smoothstep(0.0, 0.015, rawSourceLuma);
         float fc     = time * 24.0;
         float2 tnUV  = uv * screenH * 4.0;
-        float col    = tnNn(tnUV, fc);
+        float col    = tnNn(tnUV, fc) * contentMask;
         output.rgb  += clamp(float3(col, col, col), 0.0, 0.5) * tapeNoiseIntensity;
         output       = saturate(output);
     }
@@ -659,21 +1098,56 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     // SDF drives the fade entirely: gradient follows arc in corners, sides get
     // per-axis fade widths (X=0.012, Y=0.033). outN = outward normal at the
     // nearest boundary point — interpolates between axes around the arc.
-    if (vignetteEnabled >= 0.5) {
-        float  r    = 0.04;
+    if (vignetteEnabled > 0.0) {
+        float  r    = max(vignetteEnabled * 0.10, 0.022);  // radius floored at fade width so the fade hugs the edge at all settings (gradient unchanged)
         float2 qv   = abs(sampleUV - 0.5) - 0.5 + r;
         float  rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;
         float2 outN;
         if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);
         else if (qv.x > 0.0)          outN = float2(1.0, 0.0);
         else                           outN = float2(0.0, 1.0);
-        float fadeW = length(float2(outN.x * 0.012, outN.y * 0.033));
+        float fadeW = length(float2(outN.x * 0.008, outN.y * 0.020));
         output.rgb *= smoothstep(0.0, fadeW, -rSDF);
+    }
+
+    // REFL. RADIUS: round the game window's corners FOR REAL — hard-mask the
+    // rounded-off corner to black so the game stops showing square corners. The
+    // bezel composited just below covers it (as on a real CRT). mbSDF = rounded-
+    // rect SDF with radius mbR (= REFL. RADIUS); >0 only in the corner triangle,
+    // 0 on straight edges. No-op when REFL. RADIUS=0.
+    if (megaBz && mbSDF > 0.0) output.rgb = float3(0.0, 0.0, 0.0);
+
+    // Bezel PNG overlay (inside-game pixels). Standard alpha "over" composite
+    // so the bezel art layers ON TOP of the rendered game frame. Reflection
+    // pixels in the border zone already returned earlier with bezel composited.
+    if (bezelHookActive >= 0.5) {
+        float4 bz = g_BezelTex.Sample(g_BezelSamp, uv);
+        float a = bz.a * bezelHookOpacity;
+        output.rgb = output.rgb * (1.0 - a) + bz.rgb * a;
     }
 
     return output;
 }
 )";
+
+// ── Combined PS source (PS_SRC + PS_SRC2 + PS_SRC2b) — built once ────────
+// Each variable is a SEPARATE static const char* declaration (NOT inline
+// )" R"( splits within one declaration — those merge before C2026 check).
+static char* g_PS_SRC_FULL = nullptr;
+static const char* GetPSSrc() {
+    if (!g_PS_SRC_FULL) {
+        size_t l1 = strlen(PS_SRC), l2 = strlen(PS_SRC2), l3 = strlen(PS_SRC2b);
+        g_PS_SRC_FULL = (char*)malloc(l1 + l2 + l3 + 1);
+        if (g_PS_SRC_FULL) {
+            memcpy(g_PS_SRC_FULL,           PS_SRC,   l1);
+            memcpy(g_PS_SRC_FULL + l1,      PS_SRC2,  l2);
+            memcpy(g_PS_SRC_FULL + l1 + l2, PS_SRC2b, l3 + 1);
+        } else {
+            return PS_SRC;
+        }
+    }
+    return g_PS_SRC_FULL;
+}
 
 // ── D3D11 State save/restore (minimal set for fullscreen draw) ──────────
 struct SavedState {
@@ -781,16 +1255,17 @@ static bool InitResources(IDXGISwapChain* sc) {
 
     // Compile pixel shader
     ID3DBlob* psBlob = nullptr;
-    hr = D3DCompile(PS_SRC, strlen(PS_SRC), "ps", nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    const char* psSrc = GetPSSrc();
+    hr = D3DCompile(psSrc, strlen(psSrc), "ps", nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
     if (FAILED(hr) || !psBlob) { LogShaderError("D3D11 PS", errBlob); if (errBlob) errBlob->Release(); return false; }
     if (errBlob) errBlob->Release();
     hr = g_Device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_PS);
     psBlob->Release();
     if (FAILED(hr)) { Log("[D3D11] FAIL: CreatePixelShader hr=0x%08X", hr); return false; }
 
-    // Constant buffer — 96 bytes = 6 x float4
+    // Constant buffer — 13 x float4 = 208 bytes
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 160; // 10 x float4 (rows 0-7 + row 8: vhsEnabled/vhsIntensity/grainIntensity/tapeNoiseEnabled + row 9: tapeNoiseIntensity)
+    cbd.ByteWidth = 192; // 12 x float4 (rows 0-11)
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -824,6 +1299,9 @@ static bool InitResources(IDXGISwapChain* sc) {
     sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     hr = g_Device->CreateSamplerState(&sd, &g_Sampler);
+    if (FAILED(hr)) return false;
+    // Bezel sampler — same params; separate object so we can switch independently
+    hr = g_Device->CreateSamplerState(&sd, &g_BezelSamp);
     if (FAILED(hr)) return false;
 
     // Rasterizer: no culling, no scissor
@@ -864,6 +1342,80 @@ static bool InitResources(IDXGISwapChain* sc) {
 }
 
 // ── Apply scanlines to the game's backbuffer ─────────────────────────────
+// ── Bezel PNG → D3D11 texture (WIC decode, cached) ───────────────────────
+static void ReleaseBezelTexture() {
+    if (g_BezelSRV) { g_BezelSRV->Release(); g_BezelSRV = nullptr; }
+    if (g_BezelTex) { g_BezelTex->Release(); g_BezelTex = nullptr; }
+    g_BezelPathCached[0] = 0;
+}
+
+static bool LoadBezelTexture(ID3D11Device* dev, const wchar_t* path) {
+    ReleaseBezelTexture();
+    if (!path || !path[0]) {
+        Log("[BEZEL] LoadBezelTexture skipped: path=%p path[0]=%d",
+            path, (path ? (int)path[0] : -1));
+        return false;
+    }
+
+    // CoInitialize for this thread (safe to call repeatedly)
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IWICImagingFactory*    wic       = nullptr;
+    IWICBitmapDecoder*     decoder   = nullptr;
+    IWICBitmapFrameDecode* frame     = nullptr;
+    IWICFormatConverter*   converter = nullptr;
+    BYTE*                  pixels    = nullptr;
+    bool ok = false;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+    if (FAILED(hr)) { Log("[BEZEL] CoCreateInstance(WIC) hr=0x%08X", hr); goto cleanup; }
+
+    hr = wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) { Log("[BEZEL] decode '%ls' hr=0x%08X", path, hr); goto cleanup; }
+
+    if (FAILED(decoder->GetFrame(0, &frame))) goto cleanup;
+    if (FAILED(wic->CreateFormatConverter(&converter))) goto cleanup;
+    if (FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) goto cleanup;
+
+    UINT w = 0, h = 0;
+    converter->GetSize(&w, &h);
+    if (w == 0 || h == 0) goto cleanup;
+
+    UINT stride = w * 4;
+    UINT imgSize = stride * h;
+    pixels = new BYTE[imgSize];
+    if (FAILED(converter->CopyPixels(nullptr, stride, imgSize, pixels))) goto cleanup;
+
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w; td.Height = h;
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc = { 1, 0 };
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd = { pixels, stride, 0 };
+        if (FAILED(dev->CreateTexture2D(&td, &sd, &g_BezelTex))) goto cleanup;
+        if (FAILED(dev->CreateShaderResourceView(g_BezelTex, nullptr, &g_BezelSRV))) goto cleanup;
+    }
+
+    wcscpy_s(g_BezelPathCached, 260, path);
+    Log("[BEZEL] Loaded '%ls' (%ux%u) into D3D11 texture", path, w, h);
+    ok = true;
+
+cleanup:
+    if (pixels)    delete[] pixels;
+    if (converter) converter->Release();
+    if (frame)     frame->Release();
+    if (decoder)   decoder->Release();
+    if (wic)       wic->Release();
+    if (!ok)       ReleaseBezelTexture();
+    return ok;
+}
+
 static bool g_D3D11FirstFrame = true;
 static void ApplyScanlines(IDXGISwapChain* sc) {
     if (!g_Shared) { OpenSharedMem(); }
@@ -890,6 +1442,8 @@ static void ApplyScanlines(IDXGISwapChain* sc) {
             (g_Shared->grainIntensity   > 0.0f) ||
             (g_Shared->tapeNoiseEnabled > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f) ||
             (g_Shared->vignetteEnabled  > 0.0f) ||
+            (g_Shared->megaBezelEnabled > 0.0f) ||
+            (g_Shared->bezelHookActive  > 0.0f) ||
             g_Shared->brightness  != 0.0f || g_Shared->contrast    != 0.0f ||
             g_Shared->saturation  != 0.0f || g_Shared->temperature != 0.0f ||
             g_Shared->blackLevel  > 0.0f  ||
@@ -921,7 +1475,38 @@ static void ApplyScanlines(IDXGISwapChain* sc) {
     bool vhsOn        = g_Shared->vhsEnabled        > 0.0f;
     bool grainOn      = g_Shared->grainIntensity    > 0.0f;
     bool tapeNoiseOn  = g_Shared->tapeNoiseEnabled  > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f;
-    bool needCopy  = blurOn || bloomOn || curvOn || bcOn || flickOn || phosphOn || vhsOn || grainOn || tapeNoiseOn;
+    bool megaBzOn     = g_Shared->megaBezelEnabled  > 0.0f;
+    bool bezelHookOn  = g_Shared->bezelHookActive   > 0.0f;
+
+    // ── Startup blackout (megabezel only) ──
+    // For the first ~1.5s after megabezel first becomes active, blank the
+    // entire backbuffer to BLACK and skip our shader. Hides the game's launch
+    // splash / loading clear-color (vivid blue, skybox, etc.) which otherwise
+    // is what gets reflected into the bezel zone AND shines through as random
+    // color flashes inside the game viewport during the first few frames.
+    // After blackout ends, normal rendering kicks in and the megaBezelStartFade
+    // uniform smoothly ramps the reflection up over its own 1.5s window
+    // → total reveal time at game launch is ~3s of clean black-to-game.
+    if (megaBzOn) {
+        static float blackoutStart = -1.0f;
+        const float BLACKOUT_SECONDS = 1.5f;
+        if (blackoutStart < 0.0f) blackoutStart = GetTimeSeconds();
+        if ((GetTimeSeconds() - blackoutStart) < BLACKOUT_SECONDS) {
+            ID3D11RenderTargetView* rtvBlackout = nullptr;
+            if (SUCCEEDED(g_Device->CreateRenderTargetView(backbuffer, nullptr, &rtvBlackout))) {
+                float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                g_Ctx->ClearRenderTargetView(rtvBlackout, black);
+                rtvBlackout->Release();
+            }
+            backbuffer->Release();
+            return;
+        }
+    }
+
+    // megaBzOn / bezelHookOn force needCopy: reflection + bezel composite both
+    // require overwrite blend (alpha compositing in the shader) and a source
+    // texture bound at slot t0 (g_Tex for game), so we must copy the backbuffer.
+    bool needCopy  = blurOn || bloomOn || curvOn || bcOn || flickOn || phosphOn || vhsOn || grainOn || tapeNoiseOn || megaBzOn || bezelHookOn;
     if (needCopy) {
         D3D11_TEXTURE2D_DESC bbDesc;
         backbuffer->GetDesc(&bbDesc);
@@ -1011,9 +1596,17 @@ static void ApplyScanlines(IDXGISwapChain* sc) {
         cb.grainIntensity    = g_Shared->grainIntensity;
         cb.tapeNoiseEnabled  = tapeNoiseOn ? 1.0f : 0.0f;
         cb.tapeNoiseIntensity = g_Shared->tapeNoiseIntensity;
-        cb.vignetteEnabled   = g_Shared->vignetteEnabled;
-        cb._cbpad1           = 0.0f;
-        cb._cbpad2           = 0.0f;
+        cb.vignetteEnabled    = g_Shared->vignetteEnabled;
+        cb.megaBezelEnabled   = g_Shared->megaBezelEnabled;
+        cb.megaBezelThickness = g_Shared->megaBezelThickness;
+        cb.megaBezelOpacity   = g_Shared->megaBezelOpacity;
+        cb.megaBezelBlur      = g_Shared->megaBezelBlur;
+        cb.bezelHookActive    = (bezelHookOn && g_BezelSRV) ? g_Shared->bezelHookActive : 0.0f;
+        cb.bezelHookOpacity   = g_Shared->bezelHookOpacity;
+        cb.megaBezelRadius    = g_Shared->megaBezelRadius;
+        cb.megaBezelReflectionWidth = g_Shared->megaBezelReflectionWidth;
+        cb.megaBezelStartFade = GetMegaBezelStartFade(g_Shared->megaBezelEnabled > 0.0f);
+        cb._cbpad3 = 0.0f;
         memcpy(mapped.pData, &cb, sizeof(ScanlineCBData));
         g_Ctx->Unmap(g_CB, 0);
     }
@@ -1037,6 +1630,20 @@ static void ApplyScanlines(IDXGISwapChain* sc) {
     if (needCopy && g_BBSRV && g_Sampler) {
         g_Ctx->PSSetShaderResources(0, 1, &g_BBSRV);
         g_Ctx->PSSetSamplers(0, 1, &g_Sampler);
+    }
+    // Bezel texture (slot 1). Reload when shared-mem path changes.
+    // Also retry if texture is null but path is non-empty (race condition).
+    if (bezelHookOn) {
+        bool pathChanged = wcscmp(g_Shared->bezelHookPath, g_BezelPathCached) != 0;
+        if (pathChanged || (!g_BezelSRV && g_Shared->bezelHookPath[0]))
+            LoadBezelTexture(g_Device, g_Shared->bezelHookPath);
+        if (g_BezelSRV && g_BezelSamp) {
+            g_Ctx->PSSetShaderResources(1, 1, &g_BezelSRV);
+            g_Ctx->PSSetSamplers(1, 1, &g_BezelSamp);
+        }
+    } else if (g_BezelTex) {
+        // bezel turned off in shared mem → drop cached texture
+        ReleaseBezelTexture();
     }
     g_Ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_Ctx->IASetInputLayout(nullptr);
@@ -1127,6 +1734,567 @@ static void RenderOsd(IDXGISwapChain* sc) {
     surface->Release();
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+//  D3D12 PIPELINE (D3D11On12) — mirrors the native-D3D11 functions above but
+//  renders onto the game's D3D12 back buffer through a grafted D3D11 device.
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Bezel PNG → D3D11On12 texture (isolated copy of LoadBezelTexture) ─────
+static void ReleaseBezelTexture12() {
+    if (g_BezelSRV12) { g_BezelSRV12->Release(); g_BezelSRV12 = nullptr; }
+    if (g_BezelTex12) { g_BezelTex12->Release(); g_BezelTex12 = nullptr; }
+    g_BezelPathCached12[0] = 0;
+}
+static bool LoadBezelTexture12(ID3D11Device* dev, const wchar_t* path) {
+    ReleaseBezelTexture12();
+    if (!dev || !path || !path[0]) return false;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory*    wic       = nullptr;
+    IWICBitmapDecoder*     decoder   = nullptr;
+    IWICBitmapFrameDecode* frame     = nullptr;
+    IWICFormatConverter*   converter = nullptr;
+    BYTE*                  pixels    = nullptr;
+    bool ok = false;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+    if (FAILED(hr)) goto cleanup;
+    hr = wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) { Log("[D3D12-BEZEL] decode '%ls' hr=0x%08X", path, hr); goto cleanup; }
+    if (FAILED(decoder->GetFrame(0, &frame))) goto cleanup;
+    if (FAILED(wic->CreateFormatConverter(&converter))) goto cleanup;
+    if (FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) goto cleanup;
+    {
+        UINT w = 0, h = 0;
+        converter->GetSize(&w, &h);
+        if (w == 0 || h == 0) goto cleanup;
+        UINT stride = w * 4;
+        UINT imgSize = stride * h;
+        pixels = new BYTE[imgSize];
+        if (FAILED(converter->CopyPixels(nullptr, stride, imgSize, pixels))) goto cleanup;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w; td.Height = h;
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc = { 1, 0 };
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd = { pixels, stride, 0 };
+        if (FAILED(dev->CreateTexture2D(&td, &sd, &g_BezelTex12))) goto cleanup;
+        if (FAILED(dev->CreateShaderResourceView(g_BezelTex12, nullptr, &g_BezelSRV12))) goto cleanup;
+        wcscpy_s(g_BezelPathCached12, 260, path);
+        Log("[D3D12-BEZEL] Loaded '%ls' (%ux%u) into D3D11On12 texture", path, w, h);
+        ok = true;
+    }
+cleanup:
+    if (pixels)    delete[] pixels;
+    if (converter) converter->Release();
+    if (frame)     frame->Release();
+    if (decoder)   decoder->Release();
+    if (wic)       wic->Release();
+    if (!ok)       ReleaseBezelTexture12();
+    return ok;
+}
+
+// ── Detect whether a swapchain belongs to a D3D12 device ──────────────────
+static bool IsD3D12SwapChain(IDXGISwapChain* sc) {
+    if (g_D3D12Device) return true;
+    ID3D12Device* dev = nullptr;
+    HRESULT hr = sc->GetDevice(__uuidof(ID3D12Device), (void**)&dev);
+    if (SUCCEEDED(hr) && dev) { g_D3D12Device = dev; return true; }
+    if (dev) dev->Release();
+    return false;
+}
+
+// ── Initialise the D3D11On12 device + shader resources ────────────────────
+static bool InitResources12(IDXGISwapChain* sc) {
+    if (g_Inited12) return true;
+    // The command queue is captured asynchronously by HookedExecuteCommandLists.
+    if (!g_GameCmdQueue) {
+        static bool logged = false;
+        if (!logged) { logged = true; Log("[D3D12] InitResources12: awaiting DIRECT command-queue capture..."); }
+        return false;
+    }
+    if (!g_D3D12Device && !IsD3D12SwapChain(sc)) {
+        Log("[D3D12] InitResources12: GetDevice(ID3D12Device) failed");
+        return false;
+    }
+    // D3D11On12CreateDevice lives in d3d11.dll — load dynamically (no import).
+    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+    PFN_D3D11ON12_CREATE_DEVICE pOn12 = d3d11
+        ? (PFN_D3D11ON12_CREATE_DEVICE)GetProcAddress(d3d11, "D3D11On12CreateDevice") : nullptr;
+    if (!pOn12) { Log("[D3D12] D3D11On12CreateDevice not found in d3d11.dll"); return false; }
+
+    IUnknown* queues[1] = { g_GameCmdQueue };
+    // BGRA_SUPPORT enables Direct2D interop for the OSD text overlay.
+    HRESULT hr = pOn12((IUnknown*)g_D3D12Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                       queues, 1, 0, &g_Dev11on12, &g_Ctx11on12, nullptr);
+    if (FAILED(hr) || !g_Dev11on12 || !g_Ctx11on12) {
+        Log("[D3D12] D3D11On12CreateDevice hr=0x%08X", hr); return false;
+    }
+    hr = g_Dev11on12->QueryInterface(__uuidof(ID3D11On12Device), (void**)&g_On12);
+    if (FAILED(hr) || !g_On12) { Log("[D3D12] QI ID3D11On12Device hr=0x%08X", hr); return false; }
+
+    // ── Compile shaders + create states on the grafted device (mirror InitResources) ──
+    ID3DBlob* vsBlob = nullptr; ID3DBlob* errBlob = nullptr;
+    hr = D3DCompile(VS_SRC, strlen(VS_SRC), "vs", nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &errBlob);
+    if (FAILED(hr) || !vsBlob) { LogShaderError("D3D12 VS", errBlob); if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
+    hr = g_Dev11on12->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_VS12);
+    vsBlob->Release();
+    if (FAILED(hr)) { Log("[D3D12] CreateVertexShader hr=0x%08X", hr); return false; }
+
+    ID3DBlob* psBlob = nullptr;
+    const char* psSrc = GetPSSrc();
+    hr = D3DCompile(psSrc, strlen(psSrc), "ps", nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr) || !psBlob) { LogShaderError("D3D12 PS", errBlob); if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
+    hr = g_Dev11on12->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_PS12);
+    psBlob->Release();
+    if (FAILED(hr)) { Log("[D3D12] CreatePixelShader hr=0x%08X", hr); return false; }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 192;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_Dev11on12->CreateBuffer(&cbd, nullptr, &g_CB12))) return false;
+
+    D3D11_BLEND_DESC bd = {};
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend  = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
+    bd.RenderTarget[0].BlendOp   = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(g_Dev11on12->CreateBlendState(&bd, &g_Blend12))) return false;
+
+    D3D11_BLEND_DESC bdOver = {};
+    bdOver.RenderTarget[0].BlendEnable = FALSE;
+    bdOver.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(g_Dev11on12->CreateBlendState(&bdOver, &g_BlendOver12))) return false;
+
+    D3D11_SAMPLER_DESC smd = {};
+    smd.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    if (FAILED(g_Dev11on12->CreateSamplerState(&smd, &g_Sampler12))) return false;
+    if (FAILED(g_Dev11on12->CreateSamplerState(&smd, &g_BezelSamp12))) return false;
+
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.ScissorEnable = FALSE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(g_Dev11on12->CreateRasterizerState(&rd, &g_Raster12))) return false;
+
+    OpenSharedMem();
+
+    // ── D2D 1.1 device context for OSD text (NON-FATAL) ──────────────────
+    // We use a D2D device context (not CreateDxgiSurfaceRenderTarget) so OSD
+    // works regardless of the D3D12 swapchain format (BGRA or RGBA). Any
+    // failure here only disables OSD — the scanline/CRT effects still render.
+    {
+        IDXGIDevice* dxgiDev = nullptr;
+        if (SUCCEEDED(g_Dev11on12->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) && dxgiDev) {
+            if (!g_D2DFactory12) {
+                D2D1_FACTORY_OPTIONS fo = {};
+                HRESULT hrd = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                    __uuidof(ID2D1Factory1), &fo, (void**)&g_D2DFactory12);
+                if (FAILED(hrd)) { Log("[D3D12-OSD] D2D1CreateFactory hr=0x%08X", hrd); g_D2DFactory12 = nullptr; }
+            }
+            if (g_D2DFactory12 && !g_D2DDevice12) {
+                HRESULT hrd = g_D2DFactory12->CreateDevice(dxgiDev, &g_D2DDevice12);
+                if (FAILED(hrd)) { Log("[D3D12-OSD] CreateDevice hr=0x%08X", hrd); g_D2DDevice12 = nullptr; }
+            }
+            if (g_D2DDevice12 && !g_D2DCtx12) {
+                HRESULT hrd = g_D2DDevice12->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_D2DCtx12);
+                if (FAILED(hrd)) { Log("[D3D12-OSD] CreateDeviceContext hr=0x%08X", hrd); g_D2DCtx12 = nullptr; }
+            }
+            dxgiDev->Release();
+        }
+        if (!g_DWFactory) {
+            HRESULT hrd = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&g_DWFactory));
+            if (FAILED(hrd)) { Log("[D3D12-OSD] DWriteCreateFactory hr=0x%08X", hrd); g_DWFactory = nullptr; }
+        }
+        if (g_DWFactory && !g_OsdFormat) {
+            g_DWFactory->CreateTextFormat(L"Segoe UI", nullptr,
+                DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                22.0f, L"en-us", &g_OsdFormat);
+            if (g_OsdFormat) {
+                g_OsdFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                g_OsdFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            }
+        }
+        Log("[D3D12-OSD] D2D status: ctx=%s dwrite=%s format=%s",
+            g_D2DCtx12 ? "OK" : "no", g_DWFactory ? "OK" : "no", g_OsdFormat ? "OK" : "no");
+    }
+
+    g_Inited12 = true;
+    Log("[D3D12] D3D11On12 resources initialised OK (queue=0x%p)", (void*)g_GameCmdQueue);
+    return true;
+}
+
+// ── OSD text overlay on the D3D12 back buffer (via D3D11On12 + D2D 1.1) ───
+// Format-robust (works on BGRA and RGBA swapchains). Mirrors RenderOsd's
+// visuals. Fully self-contained acquire/draw/release; any failure → skip.
+static void RenderOsd12(IDXGISwapChain* sc) {
+    if (!g_Shared) { OpenSharedMem(); }
+    if (!g_Shared || !g_Shared->osdActive || !g_Shared->osdText[0]) return;
+    if (!g_D2DCtx12 || !g_DWFactory || !g_OsdFormat || !g_On12 || !g_Ctx11on12) return;
+
+    static IDXGISwapChain* s_osdSc3Src = nullptr;
+    if (!g_SC3 || s_osdSc3Src != sc) {
+        if (g_SC3) { g_SC3->Release(); g_SC3 = nullptr; }
+        if (FAILED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&g_SC3)) || !g_SC3) {
+            s_osdSc3Src = nullptr; return;
+        }
+        s_osdSc3Src = sc;
+    }
+    UINT idx = g_SC3->GetCurrentBackBufferIndex();
+
+    ID3D12Resource* bb12 = nullptr;
+    if (FAILED(sc->GetBuffer(idx, __uuidof(ID3D12Resource), (void**)&bb12)) || !bb12) return;
+    D3D11_RESOURCE_FLAGS rf = {}; rf.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Resource* wrapped = nullptr;
+    HRESULT hr = g_On12->CreateWrappedResource(
+        bb12, &rf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT,
+        __uuidof(ID3D11Resource), (void**)&wrapped);
+    bb12->Release();
+    if (FAILED(hr) || !wrapped) return;
+    g_On12->AcquireWrappedResources(&wrapped, 1);
+
+    IDXGISurface* surface = nullptr;
+    if (SUCCEEDED(wrapped->QueryInterface(__uuidof(IDXGISurface), (void**)&surface)) && surface) {
+        DXGI_SURFACE_DESC sdsc = {}; surface->GetDesc(&sdsc);
+        D2D1_BITMAP_PROPERTIES1 bp = {};
+        bp.pixelFormat.format    = sdsc.Format;
+        bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+        bp.dpiX = 96.0f; bp.dpiY = 96.0f;
+        bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+        ID2D1Bitmap1* bmp = nullptr;
+        HRESULT hb = g_D2DCtx12->CreateBitmapFromDxgiSurface(surface, &bp, &bmp);
+        if (FAILED(hb)) {
+            // Some formats need premultiplied alpha — retry once.
+            bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+            hb = g_D2DCtx12->CreateBitmapFromDxgiSurface(surface, &bp, &bmp);
+        }
+        if (SUCCEEDED(hb) && bmp) {
+            float bbW = (float)sdsc.Width, bbH = (float)sdsc.Height;
+            g_D2DCtx12->SetTarget(bmp);
+            float scale = bbH / 1080.0f; if (scale < 0.8f) scale = 0.8f;
+            UINT len = (UINT)wcsnlen(g_Shared->osdText, 127);
+            IDWriteTextLayout* layout = nullptr;
+            g_DWFactory->CreateTextLayout(g_Shared->osdText, len, g_OsdFormat, bbW * 0.8f, 100.0f, &layout);
+            if (layout) {
+                layout->SetFontSize(22.0f * scale, { 0, len });
+                DWRITE_TEXT_METRICS tm; layout->GetMetrics(&tm);
+                float padX = 32.0f * scale, padY = 14.0f * scale;
+                float boxW = tm.width + padX * 2, boxH = tm.height + padY * 2;
+                float x = (bbW - boxW) / 2.0f, y = bbH * 0.05f;
+                ID2D1SolidColorBrush* bgBrush = nullptr;
+                ID2D1SolidColorBrush* borderBrush = nullptr;
+                ID2D1SolidColorBrush* txtBrush = nullptr;
+                g_D2DCtx12->CreateSolidColorBrush(D2D1::ColorF(14.0f/255, 17.0f/255, 38.0f/255, 210.0f/255), &bgBrush);
+                g_D2DCtx12->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.165f, 1.0f, 140.0f/255), &borderBrush);
+                g_D2DCtx12->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &txtBrush);
+                g_D2DCtx12->BeginDraw();
+                float cr = 10.0f * scale;
+                D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(x, y, x + boxW, y + boxH), cr, cr);
+                if (bgBrush)     g_D2DCtx12->FillRoundedRectangle(rr, bgBrush);
+                if (borderBrush) g_D2DCtx12->DrawRoundedRectangle(rr, borderBrush, 1.0f * scale);
+                if (txtBrush)    g_D2DCtx12->DrawTextLayout(D2D1::Point2F(x + padX, y + padY), layout, txtBrush);
+                g_D2DCtx12->EndDraw();
+                if (txtBrush)    txtBrush->Release();
+                if (borderBrush) borderBrush->Release();
+                if (bgBrush)     bgBrush->Release();
+                layout->Release();
+            }
+            g_D2DCtx12->SetTarget(nullptr);
+            bmp->Release();
+        } else {
+            static bool logged = false;
+            if (!logged) { logged = true; Log("[D3D12-OSD] CreateBitmapFromDxgiSurface hr=0x%08X fmt=%u", hb, sdsc.Format); }
+        }
+        surface->Release();
+    }
+
+    g_On12->ReleaseWrappedResources(&wrapped, 1);
+    wrapped->Release();
+    g_Ctx11on12->Flush();
+}
+
+// ── Apply scanlines to the D3D12 back buffer (via D3D11On12 wrap) ─────────
+static bool g_D3D12FirstFrame = true;
+static void ApplyScanlines12(IDXGISwapChain* sc) {
+    if (!g_Shared) { OpenSharedMem(); }
+    if (!g_Shared || !g_Shared->active) return;
+    if (!g_Ctx11on12 || !g_On12 || !g_Dev11on12) return;
+
+    // Fast-path: nothing enabled → skip all GPU work (same gate as ApplyScanlines).
+    {
+        bool anyEffect =
+            g_Shared->hEnabled || g_Shared->vEnabled ||
+            (g_Shared->blurEnabled      > 0.0f && g_Shared->blurIntensity      > 0.0f) ||
+            (g_Shared->bloomEnabled     > 0.0f && g_Shared->bloomIntensity     > 0.0f) ||
+            (g_Shared->curvatureEnabled > 0.0f && g_Shared->curvatureIntensity > 0.0f) ||
+            (g_Shared->flickerEnabled   > 0.0f && g_Shared->flickerIntensity   > 0.0f) ||
+            (g_Shared->phosphorEnabled  > 0.0f && g_Shared->phosphorIntensity  > 0.0f) ||
+            (g_Shared->vhsEnabled       > 0.0f) || (g_Shared->grainIntensity   > 0.0f) ||
+            (g_Shared->tapeNoiseEnabled > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f) ||
+            (g_Shared->vignetteEnabled  > 0.0f) || (g_Shared->megaBezelEnabled > 0.0f) ||
+            (g_Shared->bezelHookActive  > 0.0f) ||
+            g_Shared->brightness  != 0.0f || g_Shared->contrast    != 0.0f ||
+            g_Shared->saturation  != 0.0f || g_Shared->temperature != 0.0f ||
+            g_Shared->blackLevel  > 0.0f  ||
+            (g_Shared->gamma != 1.0f && g_Shared->gamma != 0.0f);
+        if (!anyEffect) return;
+    }
+
+    // Current back-buffer index (flip-model rotates the buffer each frame).
+    // Re-query when the swapchain pointer changes — a fullscreen/borderless
+    // toggle can make the game recreate its swapchain, invalidating g_SC3.
+    static IDXGISwapChain* s_sc3Src = nullptr;
+    if (!g_SC3 || s_sc3Src != sc) {
+        if (g_SC3) { g_SC3->Release(); g_SC3 = nullptr; }
+        if (FAILED(sc->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&g_SC3)) || !g_SC3) {
+            static bool logged = false;
+            if (!logged) { logged = true; Log("[D3D12] QI IDXGISwapChain3 failed — cannot resolve back buffer"); }
+            s_sc3Src = nullptr;
+            return;
+        }
+        s_sc3Src = sc;
+    }
+    UINT idx = g_SC3->GetCurrentBackBufferIndex();
+
+    // Wrap the D3D12 back buffer as a D3D11 texture for THIS frame only. We do
+    // NOT cache the wrapper across frames: holding a back-buffer reference would
+    // make the game's ResizeBuffers() fail on resolution / fullscreen changes.
+    ID3D12Resource* bb12 = nullptr;
+    if (FAILED(sc->GetBuffer(idx, __uuidof(ID3D12Resource), (void**)&bb12)) || !bb12) return;
+    D3D11_RESOURCE_FLAGS rf = {};
+    rf.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Resource* wrapped = nullptr;
+    HRESULT hr = g_On12->CreateWrappedResource(
+        bb12, &rf,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT,
+        __uuidof(ID3D11Resource), (void**)&wrapped);
+    bb12->Release();
+    if (FAILED(hr) || !wrapped) {
+        static bool logged = false;
+        if (!logged) { logged = true; Log("[D3D12] CreateWrappedResource hr=0x%08X", hr); }
+        return;
+    }
+    g_On12->AcquireWrappedResources(&wrapped, 1);
+
+    ID3D11Texture2D* backbuffer = nullptr;
+    if (SUCCEEDED(wrapped->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&backbuffer)) && backbuffer) {
+        if (g_D3D12FirstFrame) {
+            DXGI_SWAP_CHAIN_DESC scd0 = {}; sc->GetDesc(&scd0);
+            Log("[D3D12] First scanline draw: %ux%u fmt=%u bufIdx=%u",
+                scd0.BufferDesc.Width, scd0.BufferDesc.Height, scd0.BufferDesc.Format, idx);
+            g_D3D12FirstFrame = false;
+        }
+
+        bool blurOn   = g_Shared->blurEnabled      > 0.0f && g_Shared->blurIntensity      > 0.0f;
+        bool bloomOn  = g_Shared->bloomEnabled     > 0.0f && g_Shared->bloomIntensity     > 0.0f;
+        bool curvOn   = g_Shared->curvatureEnabled > 0.0f && g_Shared->curvatureIntensity > 0.0f;
+        bool bcOn     = g_Shared->brightness != 0.0f || g_Shared->contrast != 0.0f || g_Shared->saturation != 0.0f || g_Shared->temperature != 0.0f
+                      || g_Shared->blackLevel > 0.0f || (g_Shared->gamma != 1.0f && g_Shared->gamma != 0.0f);
+        bool flickOn  = g_Shared->flickerEnabled   > 0.0f && g_Shared->flickerIntensity   > 0.0f;
+        bool phosphOn = g_Shared->phosphorEnabled  > 0.0f && g_Shared->phosphorIntensity  > 0.0f;
+        bool vhsOn       = g_Shared->vhsEnabled       > 0.0f;
+        bool grainOn     = g_Shared->grainIntensity   > 0.0f;
+        bool tapeNoiseOn = g_Shared->tapeNoiseEnabled > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f;
+        bool megaBzOn    = g_Shared->megaBezelEnabled > 0.0f;
+        bool bezelHookOn = g_Shared->bezelHookActive  > 0.0f;
+
+        // Startup blackout for MegaBezel (mirror native path — hides launch splash).
+        bool blackedOut = false;
+        if (megaBzOn) {
+            static float blackoutStart = -1.0f;
+            const float BLACKOUT_SECONDS = 1.5f;
+            if (blackoutStart < 0.0f) blackoutStart = GetTimeSeconds();
+            if ((GetTimeSeconds() - blackoutStart) < BLACKOUT_SECONDS) {
+                ID3D11RenderTargetView* rtvB = nullptr;
+                if (SUCCEEDED(g_Dev11on12->CreateRenderTargetView(backbuffer, nullptr, &rtvB))) {
+                    float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    g_Ctx11on12->ClearRenderTargetView(rtvB, black);
+                    rtvB->Release();
+                }
+                blackedOut = true;
+            }
+        }
+
+        bool needCopy = blurOn || bloomOn || curvOn || bcOn || flickOn || phosphOn || vhsOn || grainOn || tapeNoiseOn || megaBzOn || bezelHookOn;
+
+        if (!blackedOut) {
+            D3D11_TEXTURE2D_DESC bbDesc; backbuffer->GetDesc(&bbDesc);
+            UINT bbW2 = bbDesc.Width, bbH2 = bbDesc.Height;
+
+            if (needCopy) {
+                if (!g_BBCopy12 || g_LastBBW12 != bbW2 || g_LastBBH12 != bbH2) {
+                    if (g_BBSRV12) { g_BBSRV12->Release(); g_BBSRV12 = nullptr; }
+                    if (g_BBCopy12) { g_BBCopy12->Release(); g_BBCopy12 = nullptr; }
+                    D3D11_TEXTURE2D_DESC td = {};
+                    td.Width = bbW2; td.Height = bbH2;
+                    td.MipLevels = 1; td.ArraySize = 1;
+                    td.Format = bbDesc.Format;
+                    td.SampleDesc = { 1, 0 };
+                    td.Usage = D3D11_USAGE_DEFAULT;
+                    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    if (SUCCEEDED(g_Dev11on12->CreateTexture2D(&td, nullptr, &g_BBCopy12))) {
+                        g_Dev11on12->CreateShaderResourceView(g_BBCopy12, nullptr, &g_BBSRV12);
+                        g_LastBBW12 = bbW2; g_LastBBH12 = bbH2;
+                        Log("[D3D12] Created backbuffer copy %ux%u fmt=%u", bbW2, bbH2, bbDesc.Format);
+                    }
+                }
+                if (g_BBCopy12) {
+                    if (bbDesc.SampleDesc.Count > 1)
+                        g_Ctx11on12->ResolveSubresource(g_BBCopy12, 0, backbuffer, 0, bbDesc.Format);
+                    else
+                        g_Ctx11on12->CopyResource(g_BBCopy12, backbuffer);
+                }
+            }
+
+            ID3D11RenderTargetView* rtv = nullptr;
+            if (SUCCEEDED(g_Dev11on12->CreateRenderTargetView(backbuffer, nullptr, &rtv)) && rtv) {
+                D3D11_VIEWPORT vp = { 0, 0, (float)bbW2, (float)bbH2, 0.0f, 1.0f };
+
+                D3D11_MAPPED_SUBRESOURCE mapped;
+                if (SUCCEEDED(g_Ctx11on12->Map(g_CB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                    ScanlineCBData cb;
+                    cb.screenW    = (float)bbW2;
+                    cb.screenH    = (float)bbH2;
+                    cb.hThickness = g_Shared->hThickness;
+                    cb.hGap       = g_Shared->hGap;
+                    cb.hOpacity   = g_Shared->hOpacity;
+                    cb.hStartX    = 0.0f;
+                    cb.hWidth     = (float)bbW2;
+                    cb.hEnabled   = g_Shared->hEnabled;
+                    cb.vThickness = g_Shared->vThickness;
+                    cb.vGap       = g_Shared->vGap;
+                    cb.vOpacity   = g_Shared->vOpacity;
+                    cb.vStartY    = 0.0f;
+                    cb.vHeight    = (float)bbH2;
+                    cb.vEnabled   = g_Shared->vEnabled;
+                    cb.blurEnabled       = g_Shared->blurEnabled;
+                    cb.blurIntensity     = g_Shared->blurIntensity;
+                    cb.bloomEnabled      = g_Shared->bloomEnabled;
+                    cb.bloomIntensity    = g_Shared->bloomIntensity;
+                    cb.curvatureEnabled  = g_Shared->curvatureEnabled;
+                    cb.curvatureIntensity = g_Shared->curvatureIntensity;
+                    cb.brightness        = g_Shared->brightness;
+                    cb.contrast          = g_Shared->contrast;
+                    cb.saturation        = g_Shared->saturation;
+                    cb.temperature       = g_Shared->temperature;
+                    cb.flickerEnabled    = g_Shared->flickerEnabled;
+                    cb.flickerIntensity  = g_Shared->flickerIntensity;
+                    cb.flickerRate       = g_Shared->flickerRate;
+                    cb.time              = GetTimeSeconds();
+                    cb.blackLevel        = g_Shared->blackLevel;
+                    cb.gamma             = g_Shared->gamma;
+                    cb.phosphorEnabled   = g_Shared->phosphorEnabled;
+                    cb.phosphorIntensity = g_Shared->phosphorIntensity;
+                    cb.vhsEnabled        = g_Shared->vhsEnabled;
+                    cb.vhsIntensity      = g_Shared->vhsIntensity;
+                    cb.grainIntensity    = g_Shared->grainIntensity;
+                    cb.tapeNoiseEnabled  = tapeNoiseOn ? 1.0f : 0.0f;
+                    cb.tapeNoiseIntensity = g_Shared->tapeNoiseIntensity;
+                    cb.vignetteEnabled    = g_Shared->vignetteEnabled;
+                    cb.megaBezelEnabled   = g_Shared->megaBezelEnabled;
+                    cb.megaBezelThickness = g_Shared->megaBezelThickness;
+                    cb.megaBezelOpacity   = g_Shared->megaBezelOpacity;
+                    cb.megaBezelBlur      = g_Shared->megaBezelBlur;
+                    cb.bezelHookActive    = (bezelHookOn && g_BezelSRV12) ? g_Shared->bezelHookActive : 0.0f;
+                    cb.bezelHookOpacity   = g_Shared->bezelHookOpacity;
+                    cb.megaBezelRadius    = g_Shared->megaBezelRadius;
+                    cb.megaBezelReflectionWidth = g_Shared->megaBezelReflectionWidth;
+                    cb.megaBezelStartFade = GetMegaBezelStartFade(g_Shared->megaBezelEnabled > 0.0f);
+                    cb._cbpad3 = 0.0f;
+                    memcpy(mapped.pData, &cb, sizeof(ScanlineCBData));
+                    g_Ctx11on12->Unmap(g_CB12, 0);
+                }
+
+                SavedState saved; memset(&saved, 0, sizeof(saved));
+                SaveState(g_Ctx11on12, saved);
+
+                float blendFactor[4] = { 1, 1, 1, 1 };
+                g_Ctx11on12->OMSetRenderTargets(1, &rtv, nullptr);
+                g_Ctx11on12->OMSetBlendState(needCopy ? g_BlendOver12 : g_Blend12, blendFactor, 0xFFFFFFFF);
+                g_Ctx11on12->RSSetViewports(1, &vp);
+                g_Ctx11on12->RSSetState(g_Raster12);
+                g_Ctx11on12->VSSetShader(g_VS12, nullptr, 0);
+                g_Ctx11on12->PSSetShader(g_PS12, nullptr, 0);
+                g_Ctx11on12->PSSetConstantBuffers(0, 1, &g_CB12);
+                if (needCopy && g_BBSRV12 && g_Sampler12) {
+                    g_Ctx11on12->PSSetShaderResources(0, 1, &g_BBSRV12);
+                    g_Ctx11on12->PSSetSamplers(0, 1, &g_Sampler12);
+                }
+                if (bezelHookOn) {
+                    bool pathChanged = wcscmp(g_Shared->bezelHookPath, g_BezelPathCached12) != 0;
+                    if (pathChanged || (!g_BezelSRV12 && g_Shared->bezelHookPath[0]))
+                        LoadBezelTexture12(g_Dev11on12, g_Shared->bezelHookPath);
+                    if (g_BezelSRV12 && g_BezelSamp12) {
+                        g_Ctx11on12->PSSetShaderResources(1, 1, &g_BezelSRV12);
+                        g_Ctx11on12->PSSetSamplers(1, 1, &g_BezelSamp12);
+                    }
+                } else if (g_BezelTex12) {
+                    ReleaseBezelTexture12();
+                }
+                g_Ctx11on12->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                g_Ctx11on12->IASetInputLayout(nullptr);
+                g_Ctx11on12->Draw(3, 0);
+
+                RestoreState(g_Ctx11on12, saved);
+                rtv->Release();
+            }
+        }
+        backbuffer->Release();
+    }
+
+    g_On12->ReleaseWrappedResources(&wrapped, 1);
+    wrapped->Release();
+    g_Ctx11on12->Flush();   // submit our work to the game's command queue
+}
+
+// ── Unified DXGI frame dispatcher (auto-detects native-D3D11 vs D3D12) ─────
+// Replaces the inlined init/apply block in HookedPresent / HookedPresent1.
+// For native D3D11 games the behaviour is identical to before; for D3D12 games
+// it engages the D3D11On12 path. OSD text is not yet drawn on D3D12.
+static void ApplyDXGIFrame(IDXGISwapChain* sc) {
+    if (g_GLInited) return;   // OpenGL active — never touch DXGI (NVIDIA GL uses DXGI internally)
+
+    if (g_GfxApi == 0) {
+        // First-time API probe. Try native D3D11; if the swapchain is D3D12, switch.
+        if (InitResources(sc)) {
+            g_GfxApi = 11;
+        } else if (IsD3D12SwapChain(sc)) {
+            g_GfxApi = 12;
+            Log("[D3D12] Swapchain is D3D12 — engaging D3D11On12 parallel path");
+        } else {
+            return;  // neither ready yet — retry next frame
+        }
+    }
+
+    if (g_GfxApi == 12) {
+        if (!g_Inited12) { if (!InitResources12(sc)) return; }
+        ApplyScanlines12(sc);
+        RenderOsd12(sc);
+        return;
+    }
+
+    if (g_Inited) {
+        ApplyScanlines(sc);
+        RenderOsd(sc);
+    }
+}
+
 // ── Hooked Present ───────────────────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
@@ -1137,15 +2305,8 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
         // If OpenGL hook is already active, don't touch DXGI.
         // NVIDIA OpenGL uses DXGI internally — hooking it would double-apply
         // scanlines and crash the driver's internal swap chain.
-        if (!g_GLInited) {
-            if (!g_Inited) {
-                InitResources(pSwapChain);
-            }
-            if (g_Inited) {
-                ApplyScanlines(pSwapChain);
-                RenderOsd(pSwapChain);
-            }
-        }
+        // ApplyDXGIFrame auto-detects native D3D11 vs D3D12 (D3D11On12 path).
+        ApplyDXGIFrame(pSwapChain);
         // SDL2 borderless check (works for SDL2+D3D11 games like FNA/Axiom Verge)
         if (g_Shared) {
             bool want = (g_Shared->borderlessEnabled != 0);
@@ -1154,7 +2315,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         Log("[D3D11] EXCEPTION 0x%08X in HookedPresent — scanlines disabled", GetExceptionCode());
-        g_Inited = false; // prevent further attempts that might crash
+        g_Inited = false; g_Inited12 = false; // prevent further attempts that might crash
     }
     // Restore-call-repatch: remove inline hook before calling original so that
     // g_OrigPresent (= function body) doesn't recurse back into HookedPresent.
@@ -1184,13 +2345,8 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     static bool s_firstCall = true;
     if (s_firstCall) { s_firstCall = false; Log("[D3D11] HookedPresent1 FIRED — pSC=0x%p", (void*)pSwapChain); }
     __try {
-        if (!g_GLInited) {
-            if (!g_Inited) InitResources((IDXGISwapChain*)pSwapChain);
-            if (g_Inited) {
-                ApplyScanlines((IDXGISwapChain*)pSwapChain);
-                RenderOsd((IDXGISwapChain*)pSwapChain);
-            }
-        }
+        // ApplyDXGIFrame auto-detects native D3D11 vs D3D12 (D3D11On12 path).
+        ApplyDXGIFrame((IDXGISwapChain*)pSwapChain);
         // SDL2 borderless check (works for SDL2+D3D11 games like FNA/Axiom Verge)
         if (g_Shared) {
             bool want = (g_Shared->borderlessEnabled != 0);
@@ -1199,7 +2355,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         Log("[D3D11] EXCEPTION 0x%08X in HookedPresent1 — scanlines disabled", GetExceptionCode());
-        g_Inited = false;
+        g_Inited = false; g_Inited12 = false;
     }
     if (g_D3D11Present1Addr) {
         DWORD op;
@@ -1278,8 +2434,19 @@ static GLint g_uPhosphorEnabled, g_uPhosphorIntensity;
 static GLint g_uVhsEnabled, g_uVhsIntensity, g_uGrainIntensity;
 static GLint g_uTapeNoiseEnabled, g_uTapeNoiseIntensity;
 static GLint g_uVignetteEnabled;
+static GLint g_uMegaBezelEnabled, g_uMegaBezelThickness, g_uMegaBezelOpacity;
+static GLint g_uMegaBezelBlur, g_uMegaBezelRadius, g_uMegaBezelReflectionWidth;
+static GLint g_uMegaBezelStartFade;
+static GLint g_uGameRect;
 static GLuint g_GLBlurTex = 0;
 static int g_GLBlurTexW = 0, g_GLBlurTexH = 0;
+
+// GL bezel PNG texture — loaded via WIC, mirrors g_BezelTex (D3D11) / g_D3D9BezelTex
+static GLuint  g_GLBezelTex = 0;
+static wchar_t g_GLBezelPathCached[260] = {};
+static GLint   g_uBezelHookActive  = -1;
+static GLint   g_uBezelHookOpacity = -1;
+static GLint   g_uBezelTex         = -1;
 
 // glActiveTexture — GL 1.3+, need wglGetProcAddress on Windows
 typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC_)(GLenum);
@@ -1367,7 +2534,13 @@ static const char* GL_FS_SRC =
     "uniform float vhsEnabled, vhsIntensity, grainIntensity;\n"
     "uniform float tapeNoiseEnabled, tapeNoiseIntensity;\n"
     "uniform float vignetteEnabled;\n"
+    "uniform float megaBezelEnabled, megaBezelThickness, megaBezelOpacity;\n"
+    "uniform float megaBezelBlur, megaBezelRadius, megaBezelReflectionWidth;\n"
+    "uniform float megaBezelStartFade;\n"
+    "uniform vec4 gameRect;\n"   // (u0, v0, u1, v1) — game viewport in UV [0,1]
+    "uniform float bezelHookActive, bezelHookOpacity;\n"
     "uniform sampler2D backBuf;\n"
+    "uniform sampler2D bezelTex;\n"
     "\n"
     "float tnHash(float n) { return fract(sin(n) * 43758.5453123); }\n"
     "float tnN3d(vec3 x) {\n"
@@ -1413,18 +2586,184 @@ static const char* GL_FS_SRC =
     "}\n"
     "\n"
     "void main() {\n"
-    "    // Curvature: barrel-distort UV only — scanlines stay in screen-space\n"
+    "    // ── Curvature + MegaBezel: barrel-distort UV, reflection in border ──\n"
     "    vec2 sampleUV = vUV;\n"
     "    bool curved = curvatureEnabled >= 0.5 && curvatureIntensity > 0.0;\n"
+    "    bool megaBz = megaBezelEnabled >= 0.5;\n"
     "    float px = gl_FragCoord.x;\n"
     "    float py = screenH - gl_FragCoord.y;\n"
     "\n"
-    "    if (curved) {\n"
+    "    // MegaBezel: margin shrink in SCREEN space (vUV [0,1] = full window).\n"
+    "    // Same approach as D3D11 — the game image is 'stretched' to fill the\n"
+    "    // whole window with a uniform border. gameRect is only used later to\n"
+    "    // remap texture coordinates so backBuf sampling reads game pixels.\n"
+    "    if (megaBz) {\n"
+    "        float margin = megaBezelThickness * 0.10;\n"
+    "        if (margin < 0.001) margin = 0.001;\n"
+    "        sampleUV.x = (vUV.x - margin) / (1.0 - 2.0 * margin);\n"
+    "        sampleUV.y = (vUV.y - margin) / (1.0 - 2.0 * margin);\n"
+    "        if (curved) {\n"
+    "            sampleUV = CurveUV(sampleUV, curvatureIntensity * 0.25);\n"
+    "        }\n"
+    "    } else if (curved) {\n"
     "        sampleUV = CurveUV(vUV, curvatureIntensity * 0.25);\n"
-    "        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {\n"
-    "            outColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "    }\n"
+    "\n"
+    "    // REFL. RADIUS (megaBezelRadius) — rounds the reflection inner corner so it\n"
+    "    // hugs a rounded CRT bezel PNG. 0 = square (original); higher rounds and lets\n"
+    "    // the reflection overflow inward over the game corner. Independent of GAME\n"
+    "    // CORNERS (vignetteEnabled), which only rounds the in-game black mask.\n"
+    "    float  mbR       = megaBezelRadius * 0.025;\n"
+    "    vec2   mbCV      = sampleUV - 0.5;\n"
+    "    vec2   mbHalfExt = vec2(0.5, 0.5);\n"
+    "    vec2   mbQ       = abs(mbCV) - mbHalfExt + mbR;\n"
+    "    float  mbSDF     = length(max(mbQ, 0.0)) + min(max(mbQ.x, mbQ.y), 0.0) - mbR;\n"
+    "\n"
+    "    // Reflection boundary = SQUARE (clean miter, no fan). Game corners are\n"
+    "    // rounded separately below (REFL. RADIUS hard mask).\n"
+    "    bool outsideGame = megaBz ? (mbSDF > 0.0) : (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0);\n"
+    "\n"
+    "    if (outsideGame) {\n"
+    "        if (megaBz) {\n"
+    "            // ── Picture-frame mirror reflection ──\n"
+    "            float depthX = sampleUV.x < 0.0 ? -sampleUV.x\n"
+    "                         : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;\n"
+    "            float depthY = sampleUV.y < 0.0 ? -sampleUV.y\n"
+    "                         : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;\n"
+    "            bool sInSide   = depthX > 0.0;\n"
+    "            bool sInTopBot = depthY > 0.0;\n"
+    "            vec2 mUV_side;\n"
+    "            if (sInSide && sInTopBot) {\n"
+    "                if (depthX >= depthY) {\n"
+    "                    mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;\n"
+    "                    mUV_side.y = clamp(sampleUV.y, 0.0, 1.0);\n"
+    "                } else {\n"
+    "                    mUV_side.x = clamp(sampleUV.x, 0.0, 1.0);\n"
+    "                    mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;\n"
+    "                }\n"
+    "            } else if (sInSide) {\n"
+    "                mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;\n"
+    "                mUV_side.y = clamp(sampleUV.y, 0.0, 1.0);\n"
+    "            } else {\n"
+    "                mUV_side.x = clamp(sampleUV.x, 0.0, 1.0);\n"
+    "                mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;\n"
+    "            }\n"
+    "            float bezelDepth_side = max(depthX, depthY);\n"
+    "\n"
+    "            // Corner (radial through arc) reflection\n"
+    "            vec2  arcCenter = sign(mbCV) * (mbHalfExt - mbR);\n"
+    "            vec2  u         = mbCV - arcCenter;\n"
+    "            float distU     = max(length(u), 1e-5);\n"
+    "            vec2  mCV       = arcCenter + u * (2.0 * mbR - distU) / distU;\n"
+    "            vec2  mUV_corner = mCV + 0.5;\n"
+    "            float bezelDepth_corner = max(distU - mbR, 0.0);\n"
+    "\n"
+    "            // Blend side ↔ corner reflections\n"
+    "            // Pure 45 deg miter (radial corner mirror disabled — peacock-fan artifact).\n"
+    "            float blendCorner = 0.0;\n"
+    "            float bezelDepth = mix(bezelDepth_side, bezelDepth_corner, blendCorner);\n"
+    "            // Per-axis mirror across the ROUNDED game edge — fills the corner, no fan.\n"
+    "            vec2  cR    = sampleUV - 0.5;\n"
+    "            vec2  sgnR  = sign(cR);\n"
+    "            vec2  aR    = abs(cR);\n"
+    "            float arcCo = 0.5 - mbR;\n"
+    "            float xEdge = (aR.y > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.y-arcCo)*(aR.y-arcCo), 0.0))) : 0.5;\n"
+    "            float yEdge = (aR.x > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.x-arcCo)*(aR.x-arcCo), 0.0))) : 0.5;\n"
+    "            float depthXr = aR.x - xEdge;\n"
+    "            float depthYr = aR.y - yEdge;\n"
+    "            vec2  aM_X = vec2(2.0*xEdge - aR.x, aR.y);\n"
+    "            vec2  aM_Y = vec2(aR.x, 2.0*yEdge - aR.y);\n"
+    "            float blendW = max(mbR * 0.6, 1e-4);\n"
+    "            vec2  aM = mix(aM_Y, aM_X, smoothstep(-blendW, blendW, depthXr - depthYr));\n"
+    "            vec2  mUV = clamp(0.5 + sgnR * aM, 0.0, 1.0);\n"
+    "\n"
+    "            // Letterbox inset only on top/bottom reflections (sides keep vertical\n"
+    "            // alignment with the game — no 4% Y squish). Smooth side<->top/bottom blend.\n"
+    "            float yLetterboxInset = 0.02;\n"
+    "            float insetW = 1.0 - smoothstep(-blendW, blendW, depthXr - depthYr);\n"
+    "            mUV.y = mix(mUV.y, yLetterboxInset + mUV.y * (1.0 - 2.0 * yLetterboxInset), insetW);\n"
+    "\n"
+    "            // Remap mUV [0,1] to texture-space via gameRect so reflection\n"
+    "            // samples actual game pixels (not black bars in the backBuf).\n"
+    "            vec2 texMUV = gameRect.xy + mUV * (gameRect.zw - gameRect.xy);\n"
+    "\n"
+    "            // 7x7 Gaussian blur on reflection samples\n"
+    "            float sigma = megaBezelBlur * 5.0 + 0.0001;\n"
+    "            vec2  texel = 1.0 / vec2(screenW, screenH);\n"
+    "            vec3  reflColor;\n"
+    "            if (sigma > 0.05) {\n"
+    "                vec3  sum  = vec3(0.0);\n"
+    "                float wSum = 0.0;\n"
+    "                for (int dy = -3; dy <= 3; dy++) {\n"
+    "                    for (int dx = -3; dx <= 3; dx++) {\n"
+    "                        float d2 = float(dx*dx + dy*dy);\n"
+    "                        float w  = exp(-d2 / (2.0 * sigma * sigma));\n"
+    "                        sum  += texture(backBuf, clamp(texMUV + vec2(dx, dy) * texel * sigma, 0.0, 1.0)).rgb * w;\n"
+    "                        wSum += w;\n"
+    "                    }\n"
+    "                }\n"
+    "                reflColor = sum / wSum;\n"
+    "            } else {\n"
+    "                reflColor = texture(backBuf, texMUV).rgb;\n"
+    "            }\n"
+    "\n"
+    "            // ── Reflection width + fade (same as D3D11 — screen-space) ──\n"
+    "            float marginRef    = max(megaBezelThickness * 0.10, 0.001);\n"
+    "            float reflW        = max(megaBezelReflectionWidth, 0.001);\n"
+    "            float invShrink    = 1.0 / max(1.0 - 2.0 * marginRef, 1e-5);\n"
+    "            float curvStrength = curved ? curvatureIntensity * 0.25 : 0.0;\n"
+    "\n"
+    "            // Synthetic sampleUV at screen edges for current row/col\n"
+    "            vec2 sUV_left  = vec2((0.0 - marginRef) * invShrink, (vUV.y - marginRef) * invShrink);\n"
+    "            vec2 sUV_right = vec2((1.0 - marginRef) * invShrink, (vUV.y - marginRef) * invShrink);\n"
+    "            vec2 sUV_top   = vec2((vUV.x - marginRef) * invShrink, (0.0 - marginRef) * invShrink);\n"
+    "            vec2 sUV_bot   = vec2((vUV.x - marginRef) * invShrink, (1.0 - marginRef) * invShrink);\n"
+    "            vec2 csu_left  = curved ? CurveUV(sUV_left,  curvStrength) : sUV_left;\n"
+    "            vec2 csu_right = curved ? CurveUV(sUV_right, curvStrength) : sUV_right;\n"
+    "            vec2 csu_top   = curved ? CurveUV(sUV_top,   curvStrength) : sUV_top;\n"
+    "            vec2 csu_bot   = curved ? CurveUV(sUV_bot,   curvStrength) : sUV_bot;\n"
+    "\n"
+    "            float depthXc = sampleUV.x < 0.0 ? -sampleUV.x\n"
+    "                          : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;\n"
+    "            float depthYc = sampleUV.y < 0.0 ? -sampleUV.y\n"
+    "                          : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;\n"
+    "            float maxDepthX = sampleUV.x < 0.0 ? -csu_left.x\n"
+    "                            : sampleUV.x > 1.0 ? csu_right.x - 1.0 : 1.0;\n"
+    "            float maxDepthY = sampleUV.y < 0.0 ? -csu_top.y\n"
+    "                            : sampleUV.y > 1.0 ? csu_bot.y - 1.0 : 1.0;\n"
+    "\n"
+    "            float aspect     = screenW / max(screenH, 1.0);\n"
+    "            float xFadeScale = max(1.0 / aspect, 1.0);\n"
+    "            float yFadeScale = max(aspect, 1.0);\n"
+    "            // Corner fade follows the ARC (mirror of D3D9) so the reflection hugs the rounded corner.\n"
+    "            vec2  dirCorn   = u / max(distU, 1e-5);\n"
+    "            float corMaxX   = (maxDepthX + mbR) / max(abs(dirCorn.x), 0.01);\n"
+    "            float corMaxY   = (maxDepthY + mbR) / max(abs(dirCorn.y), 0.01);\n"
+    "            float corMaxRef = max(min(corMaxX, corMaxY) - mbR, 1e-5);\n"
+    "            float normDepth_corner = clamp(bezelDepth_corner / max(corMaxRef * reflW, 1e-5), 0.0, 1.0);\n"
+    "            float dxN = depthXc / max(maxDepthX * xFadeScale, 1e-5);\n"
+    "            float dyN = depthYc / max(maxDepthY * yFadeScale, 1e-5);\n"
+    "            float normDepth_side = clamp(max(dxN, dyN) / reflW, 0.0, 1.0);\n"
+    "            float normDepth = mix(normDepth_side, normDepth_corner, blendCorner);\n"
+    "            // Smooth quadratic falloff\n"
+    "            float fade = 1.0 - normDepth;\n"
+    "            fade = fade * fade;\n"
+    "\n"
+    "            float startFade = clamp(megaBezelStartFade, 0.0, 1.0);\n"
+    "            vec3  reflected = reflColor * megaBezelOpacity * fade * startFade;\n"
+    "            // Composite reflection ON TOP of bezel PNG (same layer order as D3D11/D3D9)\n"
+    "            if (bezelHookActive >= 0.5) {\n"
+    "                vec4 bz = texture(bezelTex, vUV);\n"
+    "                bz.rgb *= bezelHookOpacity;\n"
+    "                float ra = megaBezelOpacity * fade * startFade;\n"
+    "                outColor = vec4(reflected + bz.rgb * bz.a * (1.0 - ra), 1.0);\n"
+    "                return;\n"
+    "            }\n"
+    "            outColor = vec4(reflected, 1.0);\n"
     "            return;\n"
     "        }\n"
+    "        // Curvature with no MegaBezel: black outside\n"
+    "        if (curved) { outColor = vec4(0.0, 0.0, 0.0, 1.0); return; }\n"
     "    }\n"
     "\n"
     "    float mask = 1.0;\n"
@@ -1443,31 +2782,37 @@ static const char* GL_FS_SRC =
     "            mask *= scanlineIntensity(px, vThickness, vGap, vOpacity, fwX);\n"
     "    }\n"
     "\n"
-    "    bool needTex = blurEnabled >= 0.5 || bloomEnabled >= 0.5 || curved\n"
+    "    bool needTex = blurEnabled >= 0.5 || bloomEnabled >= 0.5 || curved || megaBz\n"
     "                || flickerEnabled >= 0.5 || phosphorEnabled >= 0.5\n"
     "                || abs(brightness) > 0.001 || abs(contrast) > 0.001\n"
     "                || abs(saturation) > 0.001 || abs(temperature) > 0.001\n"
     "                || blackLevel > 0.001 || abs(gamma - 1.0) > 0.001\n"
     "                || vhsEnabled >= 0.5 || grainIntensity > 0.001\n"
-    "                || tapeNoiseEnabled >= 0.5 || vignetteEnabled >= 0.5;\n"
+    "                || tapeNoiseEnabled >= 0.5 || vignetteEnabled > 0.0\n"
+    "                || bezelHookActive >= 0.5;\n"
     "    if (!needTex) {\n"
-    "        if (vignetteEnabled >= 0.5) {\n"
-    "            float r    = 0.04;\n"
+    "        if (vignetteEnabled > 0.0) {\n"
+    "            float r    = max(vignetteEnabled * 0.10, 0.022);\n"
     "            vec2  qv   = abs(vUV - 0.5) - 0.5 + r;\n"
     "            float rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;\n"
     "            vec2  outN;\n"
     "            if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);\n"
     "            else if (qv.x > 0.0)          outN = vec2(1.0, 0.0);\n"
     "            else                           outN = vec2(0.0, 1.0);\n"
-    "            float fadeW = length(vec2(outN.x * 0.012, outN.y * 0.033));\n"
+    "            float fadeW = length(vec2(outN.x * 0.008, outN.y * 0.020));\n"
     "            mask *= smoothstep(0.0, fadeW, -rSDF);\n"
     "        }\n"
     "        outColor = vec4(mask, mask, mask, 1.0);\n"
     "        return;\n"
     "    }\n"
     "\n"
+    "    // Remap sampleUV from game-space [0,1] to texture-space for backBuf sampling\n"
+    "    vec2 texSampleUV = sampleUV;\n"
+    "    if (megaBz && gameRect.z > gameRect.x && gameRect.w > gameRect.y) {\n"
+    "        texSampleUV = gameRect.xy + sampleUV * (gameRect.zw - gameRect.xy);\n"
+    "    }\n"
     "    vec2 texel = 1.0 / vec2(screenW, screenH);\n"
-    "    vec4 color = texture(backBuf, sampleUV);\n"
+    "    vec4 color = texture(backBuf, texSampleUV);\n"
     "\n"
     "    // Gaussian blur (must run before B/C/S/T — blur re-samples original texture)\n"
     "    if (blurEnabled >= 0.5) {\n"
@@ -1478,7 +2823,7 @@ static const char* GL_FS_SRC =
     "            for (int x = -2; x <= 2; x++) {\n"
     "                float d2 = float(x*x + y*y);\n"
     "                float w = exp(-d2 / (2.0 * sigma * sigma));\n"
-    "                blurred += texture(backBuf, sampleUV + vec2(x, y) * texel * sigma) * w;\n"
+    "                blurred += texture(backBuf, texSampleUV + vec2(x, y) * texel * sigma) * w;\n"
     "                totalW += w;\n"
     "            }\n"
     "        }\n"
@@ -1492,7 +2837,7 @@ static const char* GL_FS_SRC =
     "        float wTotal = 0.0;\n"
     "        for (int by = -3; by <= 3; by++) {\n"
     "            for (int bx = -3; bx <= 3; bx++) {\n"
-    "                vec4 s = texture(backBuf, sampleUV + vec2(bx, by) * texel * sigma);\n"
+    "                vec4 s = texture(backBuf, texSampleUV + vec2(bx, by) * texel * sigma);\n"
     "                float lum = dot(s.rgb, vec3(0.299, 0.587, 0.114));\n"
     "                float bright = clamp((lum - 0.4) * 2.5, 0.0, 1.0);\n"
     "                glow += s * bright;\n"
@@ -1521,7 +2866,7 @@ static const char* GL_FS_SRC =
     "            for (int gx = -2; gx <= 2; gx++) {\n"
     "                float d2 = float(gx*gx + gy*gy);\n"
     "                float w = exp(-d2 / 1.28);\n"
-    "                vec4 s = texture(backBuf, sampleUV + vec2(gx, gy) * texel);\n"
+    "                vec4 s = texture(backBuf, texSampleUV + vec2(gx, gy) * texel);\n"
     "                float lp = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
     "                float bright = clamp((lp - 0.3) * 3.0, 0.0, 1.0);\n"
     "                glow += s * (w * bright);\n"
@@ -1569,52 +2914,50 @@ static const char* GL_FS_SRC =
     "    if (vhsEnabled >= 0.5 && vUV.y <= 0.96) {\n"
     "        float inten = vhsIntensity;\n"
     "        float t     = time;\n"
+    "        float rawSrcLuma  = dot(texture(backBuf, texSampleUV).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float contentMask = smoothstep(0.0, 0.015, rawSrcLuma);\n"
     "        // — 1. LINE JITTER: sparse spike lines only (no global sinusoidal shift) —\n"
     "        float lineIdx = floor(vUV.y * 720.0);\n"
     "        float sH    = fract(sin(lineIdx * 127.1 + floor(t * 10.0) * 311.7) * 43758.5);\n"
     "        float spike = (sH > 0.97) ? (sH - 0.97) / 0.03 * 0.016 - 0.008 : 0.0;\n"
-    "        vec2  jUV   = sampleUV + vec2(spike * inten, 0.0);\n"
+    "        vec2  jUV   = texSampleUV + vec2(spike * inten, 0.0);\n"
     "        vec4  s0    = texture(backBuf, jUV);\n"
     "        // — 3. NTSC DOT CRAWL: animated color shimmer on chroma edges —\n"
     "        float luma0  = dot(s0.rgb, vec3(0.299, 0.587, 0.114));\n"
     "        float chrMag = clamp(length(s0.rgb - luma0) * 2.5, 0.0, 1.0);\n"
     "        float dotPhi = (vUV.x * 240.0 + floor(t * 29.97) * 0.5) * 3.14159265;\n"
-    "        output.r += sin(dotPhi)         * inten * 0.008 * chrMag;\n"
-    "        output.b += sin(dotPhi + 1.047) * inten * 0.006 * chrMag;\n"
+    "        output.r += sin(dotPhi)         * inten * 0.008 * chrMag * contentMask;\n"
+    "        output.b += sin(dotPhi + 1.047) * inten * 0.006 * chrMag * contentMask;\n"
     "        // — 4. LUMA NOISE: horizontal tape hiss streaks —\n"
     "        float ny     = floor(vUV.y * 200.0);\n"
     "        float nx     = floor(vUV.x * 15.0);\n"
     "        float nt     = floor(t * 25.0);\n"
     "        float streak = fract(sin(dot(vec2(nx + ny * 200.0, nt), vec2(127.1, 311.7))) * 43758.5) - 0.5;\n"
-    "        output.rgb  += streak * inten * 0.022;\n"
+    "        output.rgb  += streak * inten * 0.022 * contentMask;\n"
     "        // — 5. HEAD-SWITCHING BAND: bottom ~3% of screen, mechanical artifact —\n"
-    "        float headZone = smoothstep(0.97, 1.00, vUV.y);\n"
+    "        float headZone = smoothstep(0.97, 1.00, vUV.y) * contentMask;\n"
     "        float headH    = fract(sin(floor(vUV.y * 300.0) * 127.1 + floor(t * 30.0) * 311.7) * 43758.5);\n"
     "        float headOff  = (headH - 0.5) * inten * 0.030;\n"
     "        vec4  headS    = texture(backBuf, jUV + vec2(headOff, 0.0));\n"
     "        output.rgb     = mix(output.rgb, headS.rgb * mask + headH * inten * 0.35, headZone);\n"
     "        // — 6. COLOR GRADING: desaturation + luma lift + warm shadows —\n"
     "        float vLuma = dot(output.rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        output.rgb  = mix(output.rgb, vec3(vLuma), inten * 0.25);\n"
-    "        output.rgb *= mix(1.0, 1.06, inten);\n"
-    "        output.r   += inten * 0.020 * (1.0 - vLuma);\n"
-    "        output.b   -= inten * 0.014 * (1.0 - vLuma);\n"
+    "        output.rgb  = mix(output.rgb, vec3(vLuma), inten * 0.25 * contentMask);\n"
+    "        output.rgb *= mix(1.0, 1.06, inten * contentMask);\n"
+    "        output.r   += inten * 0.020 * (1.0 - vLuma) * contentMask;\n"
+    "        output.b   -= inten * 0.014 * (1.0 - vLuma) * contentMask;\n"
     "        output      = clamp(output, 0.0, 1.0);\n"
     "    }\n"
     "\n"
-    "    // Film Grain — organic clumped grain (film-like, not digital noise)\n"
+    "    // Film Grain — true per-pixel noise, hash without sine (no periodic banding)\n"
     "    if (grainIntensity > 0.001) {\n"
     "        float lum   = dot(output.rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        vec2  tOff  = floor(time * 24.0) * vec2(17.0, 13.0);\n"
-    "        vec2  gc    = floor(gl_FragCoord.xy * 0.5 + tOff);\n"
-    "        float g0    = fract(sin(dot(gc,               vec2(127.1, 311.7))) * 43758.5453) - 0.5;\n"
-    "        float g1    = fract(sin(dot(gc + vec2(1,0),   vec2(311.7,  92.9))) * 43758.5453) - 0.5;\n"
-    "        float g2    = fract(sin(dot(gc + vec2(0,1),   vec2( 92.9, 213.7))) * 43758.5453) - 0.5;\n"
-    "        vec2  gf    = floor(gl_FragCoord.xy + tOff * 1.3);\n"
-    "        float gFine = fract(sin(dot(gf, vec2(213.7, 127.1))) * 43758.5453) - 0.5;\n"
-    "        float grain = (g0 + g1 + g2) * 0.333 * 0.65 + gFine * 0.35;\n"
-    "        float amp   = 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0) * 0.55;\n"
-    "        output.rgb += grain * grainIntensity * 0.22 * amp;\n"
+    "        vec3  p3    = fract(vec3(gl_FragCoord.xy, floor(time * 24.0) + 1.0)\n"
+    "                          * vec3(0.1031, 0.1030, 0.0973));\n"
+    "        p3         += dot(p3, p3.yzx + 33.33);\n"
+    "        float grain = fract((p3.x + p3.y) * p3.z) * 2.0 - 1.0;\n"
+    "        float amp   = 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0);\n"
+    "        output.rgb += grain * grainIntensity * 0.18 * amp;\n"
     "        output = clamp(output, 0.0, 1.0);\n"
     "    }\n"
     "\n"
@@ -1627,16 +2970,25 @@ static const char* GL_FS_SRC =
     "        output       = clamp(output, 0.0, 1.0);\n"
     "    }\n"
     "\n"
-    "    if (vignetteEnabled >= 0.5) {\n"
-    "        float r    = 0.04;\n"
+    "    if (vignetteEnabled > 0.0) {\n"
+    "        float r    = max(vignetteEnabled * 0.10, 0.022);\n"
     "        vec2  qv   = abs(sampleUV - 0.5) - 0.5 + r;\n"
     "        float rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;\n"
     "        vec2  outN;\n"
     "        if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);\n"
     "        else if (qv.x > 0.0)          outN = vec2(1.0, 0.0);\n"
     "        else                           outN = vec2(0.0, 1.0);\n"
-    "        float fadeW = length(vec2(outN.x * 0.012, outN.y * 0.033));\n"
+    "        float fadeW = length(vec2(outN.x * 0.008, outN.y * 0.020));\n"
     "        output.rgb *= smoothstep(0.0, fadeW, -rSDF);\n"
+    "    }\n"
+    "\n"
+    "    // REFL. RADIUS: hard-mask the rounded-off game corner to black (bezel covers).\n"
+    "    if (megaBz && mbSDF > 0.0) output.rgb = vec3(0.0, 0.0, 0.0);\n"
+    "    // Bezel PNG overlay (inside-game pixels) — same layer order as D3D11/D3D9\n"
+    "    if (bezelHookActive >= 0.5) {\n"
+    "        vec4 bz = texture(bezelTex, vUV);\n"
+    "        float a = bz.a * bezelHookOpacity;\n"
+    "        output.rgb = output.rgb * (1.0 - a) + bz.rgb * a;\n"
     "    }\n"
     "\n"
     "    outColor = output;\n"
@@ -1823,6 +3175,17 @@ static bool InitGLResources() {
     g_uTapeNoiseEnabled   = glGetUniformLocation_fn(g_GLProgram, "tapeNoiseEnabled");
     g_uTapeNoiseIntensity = glGetUniformLocation_fn(g_GLProgram, "tapeNoiseIntensity");
     g_uVignetteEnabled    = glGetUniformLocation_fn(g_GLProgram, "vignetteEnabled");
+    g_uMegaBezelEnabled         = glGetUniformLocation_fn(g_GLProgram, "megaBezelEnabled");
+    g_uMegaBezelThickness       = glGetUniformLocation_fn(g_GLProgram, "megaBezelThickness");
+    g_uMegaBezelOpacity         = glGetUniformLocation_fn(g_GLProgram, "megaBezelOpacity");
+    g_uMegaBezelBlur            = glGetUniformLocation_fn(g_GLProgram, "megaBezelBlur");
+    g_uMegaBezelRadius          = glGetUniformLocation_fn(g_GLProgram, "megaBezelRadius");
+    g_uMegaBezelReflectionWidth = glGetUniformLocation_fn(g_GLProgram, "megaBezelReflectionWidth");
+    g_uMegaBezelStartFade       = glGetUniformLocation_fn(g_GLProgram, "megaBezelStartFade");
+    g_uGameRect                 = glGetUniformLocation_fn(g_GLProgram, "gameRect");
+    g_uBezelHookActive  = glGetUniformLocation_fn(g_GLProgram, "bezelHookActive");
+    g_uBezelHookOpacity = glGetUniformLocation_fn(g_GLProgram, "bezelHookOpacity");
+    g_uBezelTex         = glGetUniformLocation_fn(g_GLProgram, "bezelTex");
     g_uBackBuf       = glGetUniformLocation_fn(g_GLProgram, "backBuf");
     Log("[GL] Blur uniform locations: blurEnabled=%d blurIntensity=%d backBuf=%d",
         g_uBlurEnabled, g_uBlurIntensity, g_uBackBuf);
@@ -1876,6 +3239,74 @@ static bool InitGLResources() {
 #ifndef GL_BLEND_DST
 #define GL_BLEND_DST 0x0BE0
 #endif
+
+// ── GL bezel PNG loader (WIC → OpenGL texture) ─────────────────────────────
+// Mirrors LoadBezelTexture (D3D11) and LoadBezelTextureD3D9.
+// Decodes PNG via WIC to RGBA pixels and uploads to a GL_TEXTURE_2D on unit 1.
+static void ReleaseBezelTextureGL() {
+    if (g_GLBezelTex) { glDeleteTextures(1, &g_GLBezelTex); g_GLBezelTex = 0; }
+    g_GLBezelPathCached[0] = L'\0';
+}
+
+static bool LoadBezelTextureGL(const wchar_t* path) {
+    ReleaseBezelTextureGL();
+    if (!path || !path[0]) return false;
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IWICImagingFactory*    wic       = nullptr;
+    IWICBitmapDecoder*     decoder   = nullptr;
+    IWICBitmapFrameDecode* frame     = nullptr;
+    IWICFormatConverter*   converter = nullptr;
+    BYTE*                  pixels    = nullptr;
+    bool ok = false;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+    if (FAILED(hr)) { Log("[GL-BEZEL] CoCreateInstance(WIC) hr=0x%08X", hr); goto cleanup; }
+
+    hr = wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) { Log("[GL-BEZEL] decode '%ls' hr=0x%08X", path, hr); goto cleanup; }
+
+    if (FAILED(decoder->GetFrame(0, &frame))) goto cleanup;
+    if (FAILED(wic->CreateFormatConverter(&converter))) goto cleanup;
+    if (FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) goto cleanup;
+
+    {
+        UINT w = 0, h = 0;
+        converter->GetSize(&w, &h);
+        if (w == 0 || h == 0) goto cleanup;
+
+        UINT stride = w * 4;
+        UINT imgSize = stride * h;
+        pixels = new BYTE[imgSize];
+        if (FAILED(converter->CopyPixels(nullptr, stride, imgSize, pixels))) goto cleanup;
+
+        // Upload to GL texture
+        glGenTextures(1, &g_GLBezelTex);
+        glBindTexture(GL_TEXTURE_2D, g_GLBezelTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812F /*GL_CLAMP_TO_EDGE*/);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812F /*GL_CLAMP_TO_EDGE*/);
+
+        wcscpy_s(g_GLBezelPathCached, 260, path);
+        Log("[GL-BEZEL] Loaded '%ls' (%ux%u) into GL texture %u", path, w, h, g_GLBezelTex);
+        ok = true;
+    }
+
+cleanup:
+    if (pixels)    delete[] pixels;
+    if (converter) converter->Release();
+    if (frame)     frame->Release();
+    if (decoder)   decoder->Release();
+    if (wic)       wic->Release();
+    if (!ok)       ReleaseBezelTextureGL();
+    return ok;
+}
 
 static bool g_GLFirstFrame = true;
 static void ApplyGLScanlines(HDC hdc) {
@@ -1977,7 +3408,9 @@ static void ApplyGLScanlines(HDC hdc) {
     bool glVhsOn         = g_Shared->vhsEnabled        > 0.0f;
     bool glGrainOn       = g_Shared->grainIntensity    > 0.0f;
     bool glTapeNoiseOn   = g_Shared->tapeNoiseEnabled  > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f;
-    bool glNeedCopy = (glBlurOn || glBloomOn || glCurvOn || glBcOn || glFlickOn || glPhosphOn || glVhsOn || glGrainOn || glTapeNoiseOn) && glActiveTexture_fn;
+    bool glMegaBzOn      = g_Shared->megaBezelEnabled  > 0.0f;
+    bool glBezelHookOn   = g_Shared->bezelHookActive   > 0.0f;
+    bool glNeedCopy = (glBlurOn || glBloomOn || glCurvOn || glBcOn || glFlickOn || glPhosphOn || glVhsOn || glGrainOn || glTapeNoiseOn || glMegaBzOn || glBezelHookOn) && glActiveTexture_fn;
     GLint prevTexBinding = 0;
     GLint prevActiveTexUnit = 0;
     if (glNeedCopy) {
@@ -2000,6 +3433,21 @@ static void ApplyGLScanlines(HDC hdc) {
         }
         // Copy current framebuffer into our texture
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, vpW, vpH);
+    }
+
+    // ── Load bezel PNG on texture unit 1 (mirrors D3D11/D3D9 bezel binding) ──
+    if (glBezelHookOn && glActiveTexture_fn) {
+        bool pathChanged = wcscmp(g_Shared->bezelHookPath, g_GLBezelPathCached) != 0;
+        if (pathChanged || (!g_GLBezelTex && g_Shared->bezelHookPath[0])) {
+            // Must bind unit 1 for the texture upload, then restore
+            glActiveTexture_fn(0x84C1 /*GL_TEXTURE1*/);
+            LoadBezelTextureGL(g_Shared->bezelHookPath);
+        }
+        if (g_GLBezelTex) {
+            glActiveTexture_fn(0x84C1 /*GL_TEXTURE1*/);
+            glBindTexture(GL_TEXTURE_2D, g_GLBezelTex);
+            glActiveTexture_fn(0x84C0 /*GL_TEXTURE0*/);
+        }
     }
 
     // Blur on: overwrite blend (shader writes final blurred+masked color)
@@ -2074,9 +3522,30 @@ static void ApplyGLScanlines(HDC hdc) {
     if (g_uTapeNoiseEnabled  >= 0) glUniform1f_fn(g_uTapeNoiseEnabled,  glTapeNoiseOn ? 1.0f : 0.0f);
     if (g_uTapeNoiseIntensity>= 0) glUniform1f_fn(g_uTapeNoiseIntensity,g_Shared->tapeNoiseIntensity);
     if (g_uVignetteEnabled   >= 0) glUniform1f_fn(g_uVignetteEnabled,   g_Shared->vignetteEnabled);
+    if (g_uMegaBezelEnabled         >= 0) glUniform1f_fn(g_uMegaBezelEnabled,         glMegaBzOn ? 1.0f : 0.0f);
+    if (g_uMegaBezelThickness       >= 0) glUniform1f_fn(g_uMegaBezelThickness,       g_Shared->megaBezelThickness);
+    if (g_uMegaBezelOpacity         >= 0) glUniform1f_fn(g_uMegaBezelOpacity,         g_Shared->megaBezelOpacity);
+    if (g_uMegaBezelBlur            >= 0) glUniform1f_fn(g_uMegaBezelBlur,            g_Shared->megaBezelBlur);
+    if (g_uMegaBezelRadius          >= 0) glUniform1f_fn(g_uMegaBezelRadius,          g_Shared->megaBezelRadius);
+    if (g_uMegaBezelReflectionWidth >= 0) glUniform1f_fn(g_uMegaBezelReflectionWidth, g_Shared->megaBezelReflectionWidth);
+    if (g_uMegaBezelStartFade       >= 0) glUniform1f_fn(g_uMegaBezelStartFade,       GetMegaBezelStartFade(g_Shared->megaBezelEnabled > 0.0f));
+    // gameRect: game viewport in UV [0,1] within the full window.
+    // Needed so MegaBezel reflection samples actual game pixels, not letterbox bars.
+    if (g_uGameRect >= 0 && glUniform4f_fn) {
+        float gx0 = (float)prevViewport[0] / (float)vpW;
+        float gy0 = (float)prevViewport[1] / (float)vpH;
+        float gx1 = (float)(prevViewport[0] + prevViewport[2]) / (float)vpW;
+        float gy1 = (float)(prevViewport[1] + prevViewport[3]) / (float)vpH;
+        // If the game viewport matches the full window, gameRect is (0,0,1,1) — no remap.
+        glUniform4f_fn(g_uGameRect, gx0, gy0, gx1, gy1);
+    }
     if (glNeedCopy && g_uBackBuf >= 0) {
         glUniform1i_fn(g_uBackBuf, 0); // texture unit 0
     }
+    // Bezel hook uniforms — active/opacity + texture on unit 1
+    if (g_uBezelHookActive  >= 0) glUniform1f_fn(g_uBezelHookActive,  (glBezelHookOn && g_GLBezelTex) ? 1.0f : 0.0f);
+    if (g_uBezelHookOpacity >= 0) glUniform1f_fn(g_uBezelHookOpacity, g_Shared->bezelHookOpacity);
+    if (g_uBezelTex         >= 0) glUniform1i_fn(g_uBezelTex, 1); // texture unit 1
 
     // Draw fullscreen quad (4 vertices as triangle strip)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -2107,6 +3576,11 @@ static void ApplyGLScanlines(HDC hdc) {
     glColorMask(prevColorMask[0], prevColorMask[1], prevColorMask[2], prevColorMask[3]);
     // Restore texture state
     if (glNeedCopy && glActiveTexture_fn) {
+        // Unbind bezel texture from unit 1
+        if (glBezelHookOn && g_GLBezelTex) {
+            glActiveTexture_fn(0x84C1 /*GL_TEXTURE1*/);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
         glActiveTexture_fn(0x84C0 /*GL_TEXTURE0*/);
         glBindTexture(GL_TEXTURE_2D, prevTexBinding);
         glActiveTexture_fn(prevActiveTexUnit);
@@ -2502,6 +3976,7 @@ static BOOL WINAPI HookedMakeCurrent(HDC hdc, HGLRC hglrc) {
         // Do NOT call glDelete* — the old context may already be detached/gone.
         g_GLProgram    = 0;  g_GLVao     = 0;
         g_GLBlurTex    = 0;  g_GLBlurTexW = 0; g_GLBlurTexH = 0;
+        g_GLBezelTex   = 0;  g_GLBezelPathCached[0] = L'\0';
         g_OsdGLProgram = 0;  g_OsdGLTexture = 0;
         g_OsdGLTexW    = 0;  g_OsdGLTexH    = 0;
         g_GLInited     = false;
@@ -2676,6 +4151,1070 @@ static bool InstallD3D11Hook() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+//  D3D12 COMMAND-QUEUE CAPTURE (for D3D11On12)
+// ──────────────────────────────────────────────────────────────────────────
+//  D3D11On12CreateDevice needs the game's D3D12 command queue, which the swap
+//  chain does not expose. The canonical way to obtain it is to hook
+//  ID3D12CommandQueue::ExecuteCommandLists (vtable index 10) and grab the first
+//  DIRECT queue that submits work. D3D12 runtime objects share a per-process
+//  vtable, so patching a dummy queue's vtable also intercepts the game's queue.
+//  Once captured, we restore the vtable (auto-unhook) so there is zero
+//  steady-state overhead on this hot path.
+// ──────────────────────────────────────────────────────────────────────────
+static void STDMETHODCALLTYPE HookedExecuteCommandLists(
+    ID3D12CommandQueue* queue, UINT numLists, ID3D12CommandList* const* lists)
+{
+    if (!g_GameCmdQueue && queue) {
+        __try {
+            D3D12_COMMAND_QUEUE_DESC d = queue->GetDesc();
+            if (d.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                queue->AddRef();
+                g_GameCmdQueue = queue;
+                Log("[D3D12] Captured DIRECT command queue 0x%p via ExecuteCommandLists", (void*)queue);
+                // Auto-unhook: restore the original vtable entry — no more overhead.
+                if (g_ECLVtableSlot && g_OrigECL) {
+                    DWORD op;
+                    if (VirtualProtect(g_ECLVtableSlot, sizeof(void*), PAGE_EXECUTE_READWRITE, &op)) {
+                        *g_ECLVtableSlot = (void*)g_OrigECL;
+                        VirtualProtect(g_ECLVtableSlot, sizeof(void*), op, &op);
+                    }
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    g_OrigECL(queue, numLists, lists);
+}
+
+static bool InstallD3D12QueueHook() {
+    if (g_D3D12QueueHookInstalled) return true;
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (!d3d12) {
+        // Not a D3D12 game — nothing to do (and we must not force-load d3d12.dll).
+        return false;
+    }
+    auto pCreate = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(d3d12, "D3D12CreateDevice");
+    if (!pCreate) { Log("[D3D12] D3D12CreateDevice not found"); return false; }
+
+    // Dummy device + DIRECT queue purely to read the shared vtable.
+    ID3D12Device* dummyDev = nullptr;
+    HRESULT hr = pCreate(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&dummyDev);
+    if (FAILED(hr) || !dummyDev) { Log("[D3D12] dummy D3D12CreateDevice hr=0x%08X", hr); return false; }
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* dummyQ = nullptr;
+    hr = dummyDev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&dummyQ);
+    if (FAILED(hr) || !dummyQ) { Log("[D3D12] dummy CreateCommandQueue hr=0x%08X", hr); dummyDev->Release(); return false; }
+
+    void** vt = *(void***)dummyQ;
+    g_OrigECL       = (PFN_ExecuteCommandLists)vt[10];   // ExecuteCommandLists @ index 10
+    g_ECLVtableSlot = &vt[10];
+    DWORD op;
+    bool ok = false;
+    if (VirtualProtect(&vt[10], sizeof(void*), PAGE_EXECUTE_READWRITE, &op)) {
+        vt[10] = (void*)HookedExecuteCommandLists;
+        VirtualProtect(&vt[10], sizeof(void*), op, &op);
+        ok = true;
+        Log("[D3D12] ExecuteCommandLists@10 vtable hooked (orig=0x%p) — awaiting queue", (void*)g_OrigECL);
+    } else {
+        Log("[D3D12] WARN: VirtualProtect failed for ExecuteCommandLists vtable");
+        g_OrigECL = nullptr; g_ECLVtableSlot = nullptr;
+    }
+
+    dummyQ->Release();
+    dummyDev->Release();   // vtable lives in D3D12Core.dll — patch persists after release
+    g_D3D12QueueHookInstalled = ok;
+    return ok;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  GOPHER64 DEDICATED D3D11 HOOK (PARALLEL PATH — ISOLATED FROM v1.2 CORE)
+// ──────────────────────────────────────────────────────────────────────────
+//  Gopher64 uses wgpu → D3D11 flip-model swap chains with backbuffer format
+//  R10G10B10A2_UNORM (only 2 bits of alpha) on Windows 11. Writing ANY alpha
+//  to the backbuffer causes DirectComposition to composite the window with
+//  that alpha → transparent window → user sees the desktop (blackscreen).
+//
+//  This dedicated path uses a blend state with WriteMask = R|G|B (NO alpha),
+//  format-aware backbuffer copy, and its own independent Present inline hook.
+//  It NEVER touches any of the main hook globals — guarantees zero regression
+//  for all other games/emulators.
+//
+//  Architecture:
+//   - Fires only when g_IsGopher == true (set from DllMain by exe name)
+//   - Parent process launches a child renderer (same exe name, --renderer flag)
+//     → we hook CreateProcessW/A to inject this DLL into the child
+//   - Child process installs the actual D3D11 Present hook and renders effects
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Gopher globals (all g_G_* prefix — no overlap with v1.2 state) ──────
+static ID3D11Device*              g_G_Device     = nullptr;
+static ID3D11DeviceContext*       g_G_Ctx        = nullptr;
+static ID3D11VertexShader*        g_G_VS         = nullptr;
+static ID3D11PixelShader*         g_G_PS         = nullptr;
+static ID3D11Buffer*              g_G_CB         = nullptr;
+static ID3D11BlendState*          g_G_Blend      = nullptr;   // multiplicative (alpha-safe mask)
+static ID3D11BlendState*          g_G_BlendOver  = nullptr;   // overwrite (alpha-safe mask)
+static ID3D11RasterizerState*     g_G_Raster     = nullptr;
+static ID3D11SamplerState*        g_G_Sampler    = nullptr;
+static ID3D11Texture2D*           g_G_BBCopy     = nullptr;
+static ID3D11ShaderResourceView*  g_G_BBSRV      = nullptr;
+static UINT                       g_G_LastBBW    = 0;
+static UINT                       g_G_LastBBH    = 0;
+static DXGI_FORMAT                g_G_LastBBFmt  = DXGI_FORMAT_UNKNOWN;
+static bool                       g_G_Inited     = false;
+static bool                       g_G_FirstFrame = true;
+
+static PFN_Present                g_G_OrigPresent     = nullptr;
+static BYTE*                      g_G_PresentAddr     = nullptr;
+static BYTE                       g_G_PresentOrig[14] = {};
+static BYTE                       g_G_PresentJmp[14]  = {};
+
+// Present1 (IDXGISwapChain1::Present1, vtable[22]) — wgpu switches from Present
+// to Present1 after the first window resize/fullscreen transition. Without this
+// hook, effects vanish after every state change because our Present hook is never
+// called again. Both hooks share the same g_G_HookBusy guard and effect logic.
+static PFN_Present1               g_G_OrigPresent1     = nullptr;
+static BYTE*                      g_G_Present1Addr     = nullptr;
+static BYTE                       g_G_Present1Orig[14] = {};
+static BYTE                       g_G_Present1Jmp[14]  = {};
+
+// Pre-compiled shader blobs — filled by Gopher_PrecompileShaders() in
+// GopherHookThread BEFORE the Present hook is installed.  Gopher_InitResources
+// then just calls CreateVertexShader/CreatePixelShader (instantaneous) instead
+// of D3DCompile (500ms-2s).  This eliminates the frame-stall / apparent freeze
+// that occurred when g_G_Inited was reset by an alt-tab exception and the NEXT
+// Present call re-triggered a slow shader compile inside the render thread.
+static void*                      g_G_VSBytecode   = nullptr;
+static SIZE_T                     g_G_VSBytecodeLen = 0;
+static void*                      g_G_PSBytecode   = nullptr;
+static SIZE_T                     g_G_PSBytecodeLen = 0;
+
+// Global reentrancy guard — safer than thread_local on wgpu's multi-threaded
+// renderer where different threads may call Present concurrently.
+// 0 = idle, 1 = a thread is already inside the hook applying effects.
+// We use InterlockedCompareExchange so the second thread skips effects
+// (avoiding GPU draw on two threads simultaneously) rather than blocking.
+static volatile LONG              g_G_HookBusy = 0;
+
+// ── Pre-compile shaders in background (called from GopherHookThread) ─────
+// D3DCompile is slow (500ms-2s). Do it ONCE in the background thread before
+// the Present hook is installed. Result bytecodes stored in g_G_VSBytecode /
+// g_G_PSBytecode, freed by Gopher_FreeBytecodes() on process exit.
+static bool Gopher_PrecompileShaders() {
+    Log("[GOPHER] Pre-compiling shaders (VS + PS) in background...");
+    ID3DBlob* vsBlob = nullptr; ID3DBlob* errBlob = nullptr;
+    // D3DCOMPILE_SKIP_OPTIMIZATION drastically reduces compile time (~1000ms → ~150ms)
+    // with no visual difference — we're drawing a 3-vertex fullscreen triangle, not
+    // a AAA game shader. The compiled bytecode runs fine; we trade shader speed
+    // (irrelevant at our scale) for a much shorter gap between child spawn and effects.
+    const UINT compileFlags = D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0;
+
+    HRESULT hr = D3DCompile(VS_SRC, strlen(VS_SRC), "gvs", nullptr, nullptr,
+        "main", "vs_5_0", compileFlags, 0, &vsBlob, &errBlob);
+    if (FAILED(hr) || !vsBlob) {
+        LogShaderError("GOPHER VS precompile", errBlob);
+        if (errBlob) errBlob->Release();
+        return false;
+    }
+    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
+
+    ID3DBlob* psBlob = nullptr;
+    const char* psSrc = GetPSSrc();
+    hr = D3DCompile(psSrc, strlen(psSrc), "gps", nullptr, nullptr,
+        "main", "ps_5_0", compileFlags, 0, &psBlob, &errBlob);
+    if (FAILED(hr) || !psBlob) {
+        LogShaderError("GOPHER PS precompile", errBlob);
+        vsBlob->Release();
+        if (errBlob) errBlob->Release();
+        return false;
+    }
+    if (errBlob) errBlob->Release();
+
+    // Copy to plain heap buffers so CreateVertexShader can be called from any
+    // thread without holding the COM blob alive.
+    g_G_VSBytecodeLen = vsBlob->GetBufferSize();
+    g_G_VSBytecode    = malloc(g_G_VSBytecodeLen);
+    if (g_G_VSBytecode) memcpy(g_G_VSBytecode, vsBlob->GetBufferPointer(), g_G_VSBytecodeLen);
+    vsBlob->Release();
+
+    g_G_PSBytecodeLen = psBlob->GetBufferSize();
+    g_G_PSBytecode    = malloc(g_G_PSBytecodeLen);
+    if (g_G_PSBytecode) memcpy(g_G_PSBytecode, psBlob->GetBufferPointer(), g_G_PSBytecodeLen);
+    psBlob->Release();
+
+    if (!g_G_VSBytecode || !g_G_PSBytecode) {
+        Log("[GOPHER] Pre-compile: malloc failed");
+        return false;
+    }
+    Log("[GOPHER] Shaders pre-compiled OK (VS=%zu bytes, PS=%zu bytes)",
+        g_G_VSBytecodeLen, g_G_PSBytecodeLen);
+    return true;
+}
+
+// ── Release all Gopher D3D11 resources (safe to call multiple times) ─────
+static void Gopher_ReleaseResources() {
+    if (g_G_BBSRV)   { g_G_BBSRV->Release();   g_G_BBSRV   = nullptr; }
+    if (g_G_BBCopy)  { g_G_BBCopy->Release();   g_G_BBCopy  = nullptr; }
+    if (g_G_Sampler) { g_G_Sampler->Release();  g_G_Sampler = nullptr; }
+    if (g_G_Raster)  { g_G_Raster->Release();   g_G_Raster  = nullptr; }
+    if (g_G_BlendOver){ g_G_BlendOver->Release();g_G_BlendOver=nullptr; }
+    if (g_G_Blend)   { g_G_Blend->Release();    g_G_Blend   = nullptr; }
+    if (g_G_CB)      { g_G_CB->Release();       g_G_CB      = nullptr; }
+    if (g_G_PS)      { g_G_PS->Release();       g_G_PS      = nullptr; }
+    if (g_G_VS)      { g_G_VS->Release();       g_G_VS      = nullptr; }
+    if (g_G_Ctx)     { g_G_Ctx->Release();      g_G_Ctx     = nullptr; }
+    if (g_G_Device)  { g_G_Device->Release();   g_G_Device  = nullptr; }
+    g_G_LastBBW = 0; g_G_LastBBH = 0; g_G_LastBBFmt = DXGI_FORMAT_UNKNOWN;
+    g_G_FirstFrame = true;
+}
+
+// ── Initialize Gopher D3D11 resources (own pipeline, alpha-safe blends) ──
+// Uses pre-compiled shader bytecodes — fast, safe to call inside Present.
+static bool Gopher_InitResources(IDXGISwapChain* sc) {
+    // Require pre-compiled shaders — if not ready, the caller skips effects.
+    if (!g_G_VSBytecode || !g_G_PSBytecode) {
+        Log("[GOPHER] InitResources: shader bytecodes not ready, skipping");
+        return false;
+    }
+
+    // Release any leftovers from a previous (failed) init or reinit.
+    Gopher_ReleaseResources();
+
+    Log("[GOPHER] InitResources — acquiring device from SwapChain");
+    HRESULT hr = sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_G_Device);
+    if (FAILED(hr) || !g_G_Device) { Log("[GOPHER] FAIL: GetDevice hr=0x%08X", hr); return false; }
+    g_G_Device->GetImmediateContext(&g_G_Ctx);
+    if (!g_G_Ctx) { Log("[GOPHER] FAIL: GetImmediateContext returned null"); return false; }
+
+    DXGI_SWAP_CHAIN_DESC scDesc = {};
+    sc->GetDesc(&scDesc);
+    Log("[GOPHER] SwapChain: %ux%u fmt=%u bufs=%u windowed=%d swapEffect=%u",
+        scDesc.BufferDesc.Width, scDesc.BufferDesc.Height,
+        scDesc.BufferDesc.Format, scDesc.BufferCount,
+        scDesc.Windowed, (unsigned)scDesc.SwapEffect);
+
+    // Create shaders from pre-compiled bytecodes (no D3DCompile — instantaneous)
+    hr = g_G_Device->CreateVertexShader(g_G_VSBytecode, g_G_VSBytecodeLen, nullptr, &g_G_VS);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateVertexShader hr=0x%08X", hr); return false; }
+
+    hr = g_G_Device->CreatePixelShader(g_G_PSBytecode, g_G_PSBytecodeLen, nullptr, &g_G_PS);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreatePixelShader hr=0x%08X", hr); return false; }
+
+    // Constant buffer (same layout as main path — 208 bytes / 13 float4 rows)
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth      = 208;
+    cbd.Usage          = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_G_Device->CreateBuffer(&cbd, nullptr, &g_G_CB);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateBuffer hr=0x%08X", hr); return false; }
+
+    // ── Multiplicative blend (scanline mask only) — ALPHA-SAFE ──
+    // Output.rgb = Dest.rgb * Source.rgb ;  Output.a = Dest.a (UNCHANGED).
+    // This preserves the opaque alpha the wgpu renderer wrote into the
+    // R10G10B10A2_UNORM backbuffer. DirectComposition needs that alpha=1
+    // (saturated from the 2-bit channel) to keep the window opaque.
+    D3D11_BLEND_DESC bd = {};
+    bd.RenderTarget[0].BlendEnable    = TRUE;
+    bd.RenderTarget[0].SrcBlend       = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlend      = D3D11_BLEND_SRC_COLOR;
+    bd.RenderTarget[0].BlendOp        = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;   // keep dest alpha
+    bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+    // CRITICAL: write RGB only — NEVER touch the alpha channel. On
+    // R10G10B10A2_UNORM flip-model swap chains, alpha drives DirectComposition.
+    bd.RenderTarget[0].RenderTargetWriteMask =
+        D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+    hr = g_G_Device->CreateBlendState(&bd, &g_G_Blend);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateBlendState(mul) hr=0x%08X", hr); return false; }
+
+    // ── Overwrite blend (used when the shader samples the backbuffer copy ──
+    // and writes the final color: blur, bloom, CRT curvature, VHS, etc.).
+    // Blend disabled, but WriteMask STILL excludes alpha so the existing
+    // backbuffer alpha is left untouched.
+    D3D11_BLEND_DESC bdOver = {};
+    bdOver.RenderTarget[0].BlendEnable = FALSE;
+    bdOver.RenderTarget[0].RenderTargetWriteMask =
+        D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+    hr = g_G_Device->CreateBlendState(&bdOver, &g_G_BlendOver);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateBlendState(over) hr=0x%08X", hr); return false; }
+
+    // Linear sampler for blur/curvature sampling
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    hr = g_G_Device->CreateSamplerState(&sd, &g_G_Sampler);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateSamplerState hr=0x%08X", hr); return false; }
+
+    // Rasterizer
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode        = D3D11_FILL_SOLID;
+    rd.CullMode        = D3D11_CULL_NONE;
+    rd.ScissorEnable   = FALSE;
+    rd.DepthClipEnable = TRUE;
+    hr = g_G_Device->CreateRasterizerState(&rd, &g_G_Raster);
+    if (FAILED(hr)) { Log("[GOPHER] FAIL: CreateRasterizerState hr=0x%08X", hr); return false; }
+
+    // Share the shared memory across both code paths (just calls OpenFileMapping,
+    // idempotent — no interference with main path behavior in non-Gopher procs).
+    OpenSharedMem();
+
+    g_G_Inited = true;
+    Log("[GOPHER] Resources initialized OK (alpha-safe blend, WriteMask=R|G|B)");
+    return true;
+}
+
+// ── Apply scanlines/effects for Gopher (independent pipeline) ────────────
+static void Gopher_ApplyScanlines(IDXGISwapChain* sc) {
+    // Skip effects if the swap chain's output window is minimized or not visible.
+    // During alt-tab on flip-model swap chains, DWM holds the backbuffer and a
+    // GPU draw call on it can deadlock against DWM's compositor. Bailing out
+    // here prevents the freeze without dropping frames when the game is visible.
+    {
+        DXGI_SWAP_CHAIN_DESC _d; sc->GetDesc(&_d);
+        if (_d.OutputWindow && IsIconic(_d.OutputWindow)) return;
+        // Also bail if the window handle is gone (process exiting)
+        if (_d.OutputWindow && !IsWindow(_d.OutputWindow)) {
+            Log("[GOPHER] ApplyScanlines: output window gone, skipping");
+            return;
+        }
+    }
+
+    // ── Device-mismatch check (CRITICAL for fullscreen/maximize) ─────────
+    // When wgpu changes window state (fullscreen ↔ windowed, maximize), it
+    // often destroys the D3D11 device and creates a NEW one with a NEW swap
+    // chain. Our cached g_G_Device becomes stale; any RTV / texture we create
+    // with it will silently fail because the backbuffer now belongs to a
+    // different device. Detect this and force a full re-init.
+    {
+        ID3D11Device* curDev = nullptr;
+        HRESULT hrd = sc->GetDevice(__uuidof(ID3D11Device), (void**)&curDev);
+        if (SUCCEEDED(hrd) && curDev) {
+            if (g_G_Device && curDev != g_G_Device) {
+                Log("[GOPHER] Device MISMATCH detected (cached=0x%p new=0x%p) — forcing re-init",
+                    (void*)g_G_Device, (void*)curDev);
+                curDev->Release();
+                Gopher_ReleaseResources();
+                g_G_Inited = false;
+                if (!Gopher_InitResources(sc)) {
+                    // Init failed this frame; try again next frame.
+                    return;
+                }
+            } else {
+                curDev->Release();
+            }
+        }
+    }
+
+    // ── Heartbeat log (every 300 frames ≈ 5s at 60fps) ──────────────────
+    // Helps diagnose whether the hook is still firing after window-state
+    // changes. If effects disappear and this log stops, the hook itself was
+    // lost; if it keeps firing but effects are gone, something inside is
+    // failing silently (e.g. RTV creation).
+    {
+        static LONG s_frame = 0;
+        LONG f = InterlockedIncrement(&s_frame);
+        if ((f % 300) == 1) {
+            DXGI_SWAP_CHAIN_DESC _dd; sc->GetDesc(&_dd);
+            Log("[GOPHER] Heartbeat frame=%ld sc=0x%p %ux%u fmt=%u swapEffect=%u",
+                f, (void*)sc, _dd.BufferDesc.Width, _dd.BufferDesc.Height,
+                (unsigned)_dd.BufferDesc.Format, (unsigned)_dd.SwapEffect);
+        }
+    }
+
+    if (!g_Shared) { OpenSharedMem(); }
+    if (!g_Shared) {
+        if (g_G_FirstFrame) { Log("[GOPHER] ApplyScanlines: no shared memory"); g_G_FirstFrame = false; }
+        return;
+    }
+    if (!g_Shared->active) {
+        if (g_G_FirstFrame) { Log("[GOPHER] ApplyScanlines: active=0"); g_G_FirstFrame = false; }
+        return;
+    }
+    if (!g_G_Ctx || !g_G_Device) return;
+
+    // Fast-path: any effect?
+    bool anyEffect =
+        g_Shared->hEnabled ||
+        g_Shared->vEnabled ||
+        (g_Shared->blurEnabled      > 0.0f && g_Shared->blurIntensity      > 0.0f) ||
+        (g_Shared->bloomEnabled     > 0.0f && g_Shared->bloomIntensity     > 0.0f) ||
+        (g_Shared->curvatureEnabled > 0.0f && g_Shared->curvatureIntensity > 0.0f) ||
+        (g_Shared->flickerEnabled   > 0.0f && g_Shared->flickerIntensity   > 0.0f) ||
+        (g_Shared->phosphorEnabled  > 0.0f && g_Shared->phosphorIntensity  > 0.0f) ||
+        (g_Shared->vhsEnabled       > 0.0f) ||
+        (g_Shared->grainIntensity   > 0.0f) ||
+        (g_Shared->tapeNoiseEnabled > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f) ||
+        (g_Shared->vignetteEnabled  > 0.0f) ||
+        g_Shared->brightness != 0.0f || g_Shared->contrast    != 0.0f ||
+        g_Shared->saturation != 0.0f || g_Shared->temperature != 0.0f ||
+        g_Shared->blackLevel > 0.0f  ||
+        (g_Shared->gamma != 1.0f && g_Shared->gamma != 0.0f) ||
+        g_Shared->osdActive;
+    if (!anyEffect) return;
+
+    ID3D11Texture2D* backbuffer = nullptr;
+    HRESULT hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backbuffer);
+    if (FAILED(hr) || !backbuffer) return;
+
+    bool blurOn   = g_Shared->blurEnabled       > 0.0f && g_Shared->blurIntensity       > 0.0f;
+    bool bloomOn  = g_Shared->bloomEnabled      > 0.0f && g_Shared->bloomIntensity      > 0.0f;
+    bool curvOn   = g_Shared->curvatureEnabled  > 0.0f && g_Shared->curvatureIntensity  > 0.0f;
+    bool bcOn     = g_Shared->brightness != 0.0f || g_Shared->contrast != 0.0f ||
+                    g_Shared->saturation != 0.0f || g_Shared->temperature != 0.0f ||
+                    g_Shared->blackLevel > 0.0f ||
+                    (g_Shared->gamma != 1.0f && g_Shared->gamma != 0.0f);
+    bool flickOn  = g_Shared->flickerEnabled    > 0.0f && g_Shared->flickerIntensity    > 0.0f;
+    bool phosphOn = g_Shared->phosphorEnabled   > 0.0f && g_Shared->phosphorIntensity   > 0.0f;
+    bool vhsOn    = g_Shared->vhsEnabled        > 0.0f;
+    bool grainOn  = g_Shared->grainIntensity    > 0.0f;
+    bool tapeOn   = g_Shared->tapeNoiseEnabled  > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f;
+    bool megaBzOn = g_Shared->megaBezelEnabled  > 0.0f;
+
+    // ── Startup blackout (megabezel only) — Gopher path ──
+    // Mirror of the regular HookedPresent blackout: ~1.5s of solid black at
+    // game launch to hide the splash/clear-color flash before the megabezel
+    // reflection fades in. See the regular path for full rationale.
+    if (megaBzOn) {
+        static float blackoutStart = -1.0f;
+        const float BLACKOUT_SECONDS = 1.5f;
+        if (blackoutStart < 0.0f) blackoutStart = GetTimeSeconds();
+        if ((GetTimeSeconds() - blackoutStart) < BLACKOUT_SECONDS) {
+            ID3D11RenderTargetView* rtvBlackout = nullptr;
+            if (SUCCEEDED(g_G_Device->CreateRenderTargetView(backbuffer, nullptr, &rtvBlackout))) {
+                float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                g_G_Ctx->ClearRenderTargetView(rtvBlackout, black);
+                rtvBlackout->Release();
+            }
+            backbuffer->Release();
+            return;
+        }
+    }
+
+    bool needCopy = blurOn || bloomOn || curvOn || bcOn || flickOn || phosphOn || vhsOn || grainOn || tapeOn || megaBzOn;
+
+    D3D11_TEXTURE2D_DESC bbDesc;
+    backbuffer->GetDesc(&bbDesc);
+
+    if (g_G_FirstFrame) {
+        Log("[GOPHER] First frame — bb=%ux%u fmt=%u needCopy=%d hEn=%d vEn=%d",
+            bbDesc.Width, bbDesc.Height, (unsigned)bbDesc.Format, needCopy?1:0,
+            g_Shared->hEnabled, g_Shared->vEnabled);
+        g_G_FirstFrame = false;
+    }
+
+    // Format-aware backbuffer copy (R10G10B10A2_UNORM natively supported)
+    if (needCopy) {
+        UINT bbW2 = bbDesc.Width, bbH2 = bbDesc.Height;
+        if (!g_G_BBCopy || g_G_LastBBW != bbW2 || g_G_LastBBH != bbH2 || g_G_LastBBFmt != bbDesc.Format) {
+            if (g_G_BBSRV)  { g_G_BBSRV->Release();  g_G_BBSRV  = nullptr; }
+            if (g_G_BBCopy) { g_G_BBCopy->Release(); g_G_BBCopy = nullptr; }
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width      = bbW2;
+            td.Height     = bbH2;
+            td.MipLevels  = 1;
+            td.ArraySize  = 1;
+            td.Format     = bbDesc.Format;              // format-aware
+            td.SampleDesc = { 1, 0 };
+            td.Usage      = D3D11_USAGE_DEFAULT;
+            td.BindFlags  = D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(g_G_Device->CreateTexture2D(&td, nullptr, &g_G_BBCopy))) {
+                g_G_Device->CreateShaderResourceView(g_G_BBCopy, nullptr, &g_G_BBSRV);
+                g_G_LastBBW = bbW2; g_G_LastBBH = bbH2; g_G_LastBBFmt = bbDesc.Format;
+                Log("[GOPHER] Backbuffer copy created %ux%u fmt=%u", bbW2, bbH2, bbDesc.Format);
+            } else {
+                Log("[GOPHER] WARN: CreateTexture2D for backbuffer copy FAILED (fmt=%u)", bbDesc.Format);
+            }
+        }
+        if (g_G_BBCopy) {
+            if (bbDesc.SampleDesc.Count > 1)
+                g_G_Ctx->ResolveSubresource(g_G_BBCopy, 0, backbuffer, 0, bbDesc.Format);
+            else
+                g_G_Ctx->CopyResource(g_G_BBCopy, backbuffer);
+        }
+    }
+
+    // RTV for backbuffer (native format)
+    ID3D11RenderTargetView* rtv = nullptr;
+    hr = g_G_Device->CreateRenderTargetView(backbuffer, nullptr, &rtv);
+    backbuffer->Release();
+    if (FAILED(hr) || !rtv) {
+        // Log ONCE per failure streak so we can diagnose. This typically means
+        // the backbuffer belongs to a different device than our cached one —
+        // the device-mismatch check at the top SHOULD have caught this, but
+        // if it still fails, force re-init next frame.
+        static HRESULT s_lastRtvFail = S_OK;
+        if (hr != s_lastRtvFail) {
+            Log("[GOPHER] CreateRenderTargetView FAILED hr=0x%08X — forcing re-init next frame", hr);
+            s_lastRtvFail = hr;
+        }
+        Gopher_ReleaseResources();
+        g_G_Inited = false;
+        return;
+    }
+
+    DXGI_SWAP_CHAIN_DESC scDesc;
+    sc->GetDesc(&scDesc);
+    D3D11_VIEWPORT vp = { 0, 0,
+        (float)scDesc.BufferDesc.Width, (float)scDesc.BufferDesc.Height,
+        0.0f, 1.0f };
+
+    float bbW = (float)scDesc.BufferDesc.Width;
+    float bbH = (float)scDesc.BufferDesc.Height;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = g_G_Ctx->Map(g_G_CB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        ScanlineCBData cb;
+        cb.screenW = bbW; cb.screenH = bbH;
+        cb.hThickness = g_Shared->hThickness; cb.hGap = g_Shared->hGap;
+        cb.hOpacity   = g_Shared->hOpacity;   cb.hStartX = 0.0f;
+        cb.hWidth     = bbW;                  cb.hEnabled = g_Shared->hEnabled;
+        cb.vThickness = g_Shared->vThickness; cb.vGap = g_Shared->vGap;
+        cb.vOpacity   = g_Shared->vOpacity;   cb.vStartY = 0.0f;
+        cb.vHeight    = bbH;                  cb.vEnabled = g_Shared->vEnabled;
+        cb.blurEnabled       = g_Shared->blurEnabled;
+        cb.blurIntensity     = g_Shared->blurIntensity;
+        cb.bloomEnabled      = g_Shared->bloomEnabled;
+        cb.bloomIntensity    = g_Shared->bloomIntensity;
+        cb.curvatureEnabled  = g_Shared->curvatureEnabled;
+        cb.curvatureIntensity = g_Shared->curvatureIntensity;
+        cb.brightness        = g_Shared->brightness;
+        cb.contrast          = g_Shared->contrast;
+        cb.saturation        = g_Shared->saturation;
+        cb.temperature       = g_Shared->temperature;
+        cb.flickerEnabled    = g_Shared->flickerEnabled;
+        cb.flickerIntensity  = g_Shared->flickerIntensity;
+        cb.flickerRate       = g_Shared->flickerRate;
+        cb.time              = GetTimeSeconds();
+        cb.blackLevel        = g_Shared->blackLevel;
+        cb.gamma             = g_Shared->gamma;
+        cb.phosphorEnabled   = g_Shared->phosphorEnabled;
+        cb.phosphorIntensity = g_Shared->phosphorIntensity;
+        cb.vhsEnabled        = g_Shared->vhsEnabled;
+        cb.vhsIntensity      = g_Shared->vhsIntensity;
+        cb.grainIntensity    = g_Shared->grainIntensity;
+        cb.tapeNoiseEnabled  = tapeOn ? 1.0f : 0.0f;
+        cb.tapeNoiseIntensity = g_Shared->tapeNoiseIntensity;
+        cb.vignetteEnabled    = g_Shared->vignetteEnabled;
+        cb.megaBezelEnabled   = g_Shared->megaBezelEnabled;
+        cb.megaBezelThickness = g_Shared->megaBezelThickness;
+        cb.megaBezelOpacity   = g_Shared->megaBezelOpacity;
+        cb.megaBezelBlur      = g_Shared->megaBezelBlur;
+        cb.bezelHookActive    = (g_Shared->bezelHookActive > 0.0f && g_BezelSRV) ? g_Shared->bezelHookActive : 0.0f;
+        cb.bezelHookOpacity   = g_Shared->bezelHookOpacity;
+        cb.megaBezelRadius    = g_Shared->megaBezelRadius;
+        cb.megaBezelReflectionWidth = g_Shared->megaBezelReflectionWidth;
+        cb.megaBezelStartFade = GetMegaBezelStartFade(g_Shared->megaBezelEnabled > 0.0f);
+        cb._cbpad3 = 0.0f;
+        memcpy(mapped.pData, &cb, sizeof(ScanlineCBData));
+        g_G_Ctx->Unmap(g_G_CB, 0);
+    }
+
+    // Save/restore game state — reuse v1.2's SavedState/SaveState/RestoreState
+    SavedState saved; memset(&saved, 0, sizeof(saved));
+    SaveState(g_G_Ctx, saved);
+
+    float blendFactor[4] = { 1, 1, 1, 1 };
+    g_G_Ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g_G_Ctx->OMSetBlendState(needCopy ? g_G_BlendOver : g_G_Blend, blendFactor, 0xFFFFFFFF);
+    g_G_Ctx->RSSetViewports(1, &vp);
+    g_G_Ctx->RSSetState(g_G_Raster);
+    g_G_Ctx->VSSetShader(g_G_VS, nullptr, 0);
+    g_G_Ctx->PSSetShader(g_G_PS, nullptr, 0);
+    g_G_Ctx->PSSetConstantBuffers(0, 1, &g_G_CB);
+    if (needCopy && g_G_BBSRV && g_G_Sampler) {
+        g_G_Ctx->PSSetShaderResources(0, 1, &g_G_BBSRV);
+        g_G_Ctx->PSSetSamplers(0, 1, &g_G_Sampler);
+    }
+    g_G_Ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_G_Ctx->IASetInputLayout(nullptr);
+
+    g_G_Ctx->Draw(3, 0);
+
+    RestoreState(g_G_Ctx, saved);
+
+    rtv->Release();
+}
+
+// ── Hooked Present for Gopher (independent from main path) ───────────────
+static HRESULT STDMETHODCALLTYPE HookedPresent_Gopher(
+    IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
+{
+    static bool s_firstCall = true;
+    if (s_firstCall) { s_firstCall = false; Log("[GOPHER] HookedPresent_Gopher FIRED — pSC=0x%p", (void*)pSwapChain); }
+
+    // Global reentrancy guard — wgpu may call Present from multiple threads.
+    // If another thread is already inside our effect path, skip effects this
+    // frame rather than double-applying or racing on GPU resources.
+    // InterlockedCompareExchange: atomically set busy=1 only if it was 0.
+    if (InterlockedCompareExchange(&g_G_HookBusy, 1, 0) == 0) {
+        __try {
+            if (!g_G_Inited) {
+                // InitResources is now fast (uses pre-compiled bytecodes).
+                // Safe to call here — no shader compile, just CreateVertexShader etc.
+                Gopher_InitResources(pSwapChain);
+            }
+            if (g_G_Inited) {
+                Gopher_ApplyScanlines(pSwapChain);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            // On exception (e.g. device lost, DWM transition during alt-tab):
+            // release all resources cleanly and allow re-init on next frame.
+            // Re-init is now fast (no D3DCompile), so this doesn't freeze.
+            Log("[GOPHER] EXCEPTION 0x%08X in HookedPresent_Gopher — reinit next frame",
+                GetExceptionCode());
+            Gopher_ReleaseResources();
+            g_G_Inited = false;
+        }
+        InterlockedExchange(&g_G_HookBusy, 0);
+    }
+
+    // Restore-call-repatch: temporarily restore the first 14 bytes of Present
+    // so the real function body executes without re-entering our hook.
+    if (g_G_PresentAddr) {
+        DWORD op;
+        VirtualProtect(g_G_PresentAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_PresentAddr, g_G_PresentOrig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_PresentAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_PresentAddr, HOOK_JMP_SIZE, op, &op);
+        HRESULT hr = g_G_OrigPresent(pSwapChain, SyncInterval, Flags);
+        VirtualProtect(g_G_PresentAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_PresentAddr, g_G_PresentJmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_PresentAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_PresentAddr, HOOK_JMP_SIZE, op, &op);
+        return hr;
+    }
+    return g_G_OrigPresent(pSwapChain, SyncInterval, Flags);
+}
+
+// ── Hooked Present1 for Gopher (mirrors HookedPresent_Gopher for Present1) ─
+// wgpu calls IDXGISwapChain::Present for the very first frame after a resize,
+// then permanently switches to IDXGISwapChain1::Present1 (vtable[22]).
+// Without this hook, effects disappear after every window state change because
+// our HookedPresent_Gopher is never reached again.
+static HRESULT STDMETHODCALLTYPE HookedPresent1_Gopher(
+    IDXGISwapChain1* pSwapChain, UINT SyncInterval, UINT Flags,
+    const DXGI_PRESENT_PARAMETERS* pPresentParams)
+{
+    static bool s_firstCall = true;
+    if (s_firstCall) { s_firstCall = false; Log("[GOPHER] HookedPresent1_Gopher FIRED — pSC=0x%p", (void*)pSwapChain); }
+
+    if (InterlockedCompareExchange(&g_G_HookBusy, 1, 0) == 0) {
+        __try {
+            if (!g_G_Inited) {
+                Gopher_InitResources((IDXGISwapChain*)pSwapChain);
+            }
+            if (g_G_Inited) {
+                Gopher_ApplyScanlines((IDXGISwapChain*)pSwapChain);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("[GOPHER] EXCEPTION 0x%08X in HookedPresent1_Gopher — reinit next frame",
+                GetExceptionCode());
+            Gopher_ReleaseResources();
+            g_G_Inited = false;
+        }
+        InterlockedExchange(&g_G_HookBusy, 0);
+    }
+
+    // Restore-call-repatch for Present1.
+    if (g_G_Present1Addr) {
+        DWORD op;
+        VirtualProtect(g_G_Present1Addr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_Present1Addr, g_G_Present1Orig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_Present1Addr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_Present1Addr, HOOK_JMP_SIZE, op, &op);
+        HRESULT hr = g_G_OrigPresent1(pSwapChain, SyncInterval, Flags, pPresentParams);
+        VirtualProtect(g_G_Present1Addr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_Present1Addr, g_G_Present1Jmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_Present1Addr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_Present1Addr, HOOK_JMP_SIZE, op, &op);
+        return hr;
+    }
+    return g_G_OrigPresent1(pSwapChain, SyncInterval, Flags, pPresentParams);
+}
+
+// ── Install Gopher Present inline hook (no vtable patch) ─────────────────
+static bool InstallGopher64Hook() {
+    if (!GetModuleHandleW(L"d3d11.dll") || !GetModuleHandleW(L"dxgi.dll")) {
+        Log("[GOPHER] InstallGopher64Hook: d3d11.dll or dxgi.dll not loaded, skipping");
+        return false;
+    }
+    Log("[GOPHER] InstallGopher64Hook: creating dummy device to extract Present address");
+
+    WNDCLASSEXW wc = { sizeof(WNDCLASSEXW), 0, DefWindowProcW, 0, 0,
+        GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr,
+        L"S4W_GopherDummyWC", nullptr };
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_OVERLAPPED,
+        0, 0, 4, 4, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) return false;
+
+    // Use BitBlt-model — Windows 11 shares Present vtable between BitBlt and
+    // Flip swap chains, so the address we extract here is the same one the
+    // Gopher wgpu flip-model swap chain will call.
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount        = 1;
+    sd.BufferDesc.Width   = 4;
+    sd.BufferDesc.Height  = 4;
+    sd.BufferDesc.Format  = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow       = hwnd;
+    sd.SampleDesc.Count   = 1;
+    sd.Windowed           = TRUE;
+
+    IDXGISwapChain* dummySC = nullptr;
+    ID3D11Device* dummyDev = nullptr;
+    ID3D11DeviceContext* dummyCtx = nullptr;
+    D3D_FEATURE_LEVEL fl;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        nullptr, 0, D3D11_SDK_VERSION,
+        &sd, &dummySC, &dummyDev, &fl, &dummyCtx);
+    if (FAILED(hr) || !dummySC) {
+        Log("[GOPHER] FAIL: D3D11CreateDeviceAndSwapChain hr=0x%08X", hr);
+        DestroyWindow(hwnd);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return false;
+    }
+
+    void** vtable = *(void***)dummySC;
+    g_G_OrigPresent  = (PFN_Present)vtable[8];
+    g_G_PresentAddr  = (BYTE*)g_G_OrigPresent;
+
+    // QI for IDXGISwapChain1 to extract Present1 (vtable[22]) — must be done
+    // BEFORE releasing dummySC, otherwise the vtable pointer may become invalid.
+    IDXGISwapChain1* dummySC1 = nullptr;
+    if (SUCCEEDED(dummySC->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&dummySC1))) {
+        void** vtable1 = *(void***)dummySC1;
+        g_G_OrigPresent1 = (PFN_Present1)vtable1[22];
+        g_G_Present1Addr = (BYTE*)g_G_OrigPresent1;
+        dummySC1->Release();
+        Log("[GOPHER] Present1 address extracted: 0x%p", (void*)g_G_Present1Addr);
+    } else {
+        Log("[GOPHER] WARN: IDXGISwapChain1 QI failed — Present1 hook NOT installed");
+    }
+
+    dummySC->Release();
+    dummyDev->Release();
+    dummyCtx->Release();
+    DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    if (!g_G_PresentAddr) {
+        Log("[GOPHER] FAIL: could not extract Present address");
+        return false;
+    }
+
+    // Inline hook ONLY — no vtable patch. Gopher64 uses per-instance vtables
+    // through wgpu's DXGI factory, so the vtable patch wouldn't take. The
+    // inline hook on dxgi.dll's Present/Present1 byte-patches the function body,
+    // which affects every swap chain in this process.
+    bool ok = false;
+    if (InstallHookAt(g_G_PresentAddr, g_G_PresentOrig, g_G_PresentJmp, (void*)HookedPresent_Gopher)) {
+        Log("[GOPHER] Inline hook installed: Present at 0x%p", (void*)g_G_PresentAddr);
+        ok = true;
+    } else {
+        Log("[GOPHER] FAIL: InstallHookAt(Present) returned false");
+        g_G_PresentAddr = nullptr;
+    }
+
+    // Install Present1 inline hook — same function body address as the main D3D11
+    // path. Guard against the rare case where Present and Present1 resolve to the
+    // same address (some DXGI versions share the implementation).
+    if (g_G_Present1Addr && g_G_Present1Addr != g_G_PresentAddr) {
+        if (InstallHookAt(g_G_Present1Addr, g_G_Present1Orig, g_G_Present1Jmp, (void*)HookedPresent1_Gopher)) {
+            Log("[GOPHER] Inline hook installed: Present1 at 0x%p", (void*)g_G_Present1Addr);
+            ok = true;
+        } else {
+            Log("[GOPHER] WARN: InstallHookAt(Present1) returned false");
+            g_G_Present1Addr = nullptr;
+        }
+    } else if (g_G_Present1Addr && g_G_Present1Addr == g_G_PresentAddr) {
+        // Present and Present1 share the same function body — the Present hook
+        // already covers both. No separate hook needed; clear Present1 addr so
+        // HookedPresent1_Gopher's restore-call-repatch doesn't double-restore.
+        Log("[GOPHER] Present1 == Present address — single hook covers both");
+        g_G_Present1Addr = nullptr;
+        g_G_OrigPresent1 = (PFN_Present1)(void*)g_G_OrigPresent;
+    }
+
+    return ok;
+}
+
+static bool SafeInstallGopher64Hook() {
+    __try { return InstallGopher64Hook(); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("[GOPHER] InstallGopher64Hook: EXCEPTION 0x%08X caught", GetExceptionCode());
+        return false;
+    }
+}
+
+// ── Gopher-gated CreateProcessW/A hook (child renderer injection) ────────
+// Gopher64 parent spawns a child with the same exe name for rendering. Our
+// DLL must be injected into the child before its D3D11 renderer boots. We
+// install CREATE_SUSPENDED, LoadLibraryW-inject, then ResumeThread.
+typedef BOOL (WINAPI *PFN_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *PFN_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+
+static PFN_CreateProcessW g_G_OrigCreateProcessW = nullptr;
+static BYTE*              g_G_CPWAddr            = nullptr;
+static BYTE               g_G_CPWOrig[14]        = {};
+static BYTE               g_G_CPWJmp[14]         = {};
+
+static PFN_CreateProcessA g_G_OrigCreateProcessA = nullptr;
+static BYTE*              g_G_CPAAddr            = nullptr;
+static BYTE               g_G_CPAOrig[14]        = {};
+static BYTE               g_G_CPAJmp[14]         = {};
+
+// Inject this DLL into a process by path, using CreateRemoteThread(LoadLibraryW).
+static bool InjectSelfInto(HANDLE hProc, HANDLE hThread) {
+    wchar_t dllPath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(g_Module, dllPath, MAX_PATH)) {
+        Log("[GOPHER] Inject: GetModuleFileNameW failed");
+        return false;
+    }
+    SIZE_T pathBytes = (wcslen(dllPath) + 1) * sizeof(wchar_t);
+    LPVOID remoteMem = VirtualAllocEx(hProc, nullptr, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteMem) { Log("[GOPHER] Inject: VirtualAllocEx failed"); return false; }
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProc, remoteMem, dllPath, pathBytes, &written) || written != pathBytes) {
+        Log("[GOPHER] Inject: WriteProcessMemory failed");
+        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+    HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+    LPVOID pLoadLib = hK32 ? (LPVOID)GetProcAddress(hK32, "LoadLibraryW") : nullptr;
+    if (!pLoadLib) { Log("[GOPHER] Inject: GetProcAddress(LoadLibraryW) failed"); VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE); return false; }
+    HANDLE hRT = CreateRemoteThread(hProc, nullptr, 0,
+        (LPTHREAD_START_ROUTINE)pLoadLib, remoteMem, 0, nullptr);
+    if (!hRT) { Log("[GOPHER] Inject: CreateRemoteThread failed gle=%u", GetLastError()); VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE); return false; }
+    WaitForSingleObject(hRT, 5000);
+    CloseHandle(hRT);
+    // Don't free remoteMem — LoadLibraryW holds a reference until the child
+    // copy of the string is read. Small leak, but guaranteed safe.
+    Log("[GOPHER] Inject: DLL injected OK (%ls)", dllPath);
+    return true;
+}
+
+static BOOL WINAPI HookedCreateProcessW_Gopher(
+    LPCWSTR appName, LPWSTR cmdLine, LPSECURITY_ATTRIBUTES procAttr,
+    LPSECURITY_ATTRIBUTES thrAttr, BOOL inheritHandles, DWORD flags,
+    LPVOID env, LPCWSTR curDir, LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
+{
+    DWORD forcedFlags = flags | CREATE_SUSPENDED;
+    // Restore-call-repatch around the real CreateProcessW
+    BOOL ok = FALSE;
+    if (g_G_CPWAddr) {
+        DWORD op;
+        VirtualProtect(g_G_CPWAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_CPWAddr, g_G_CPWOrig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_CPWAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_CPWAddr, HOOK_JMP_SIZE, op, &op);
+        ok = g_G_OrigCreateProcessW(appName, cmdLine, procAttr, thrAttr, inheritHandles,
+                                    forcedFlags, env, curDir, si, pi);
+        VirtualProtect(g_G_CPWAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_CPWAddr, g_G_CPWJmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_CPWAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_CPWAddr, HOOK_JMP_SIZE, op, &op);
+    } else {
+        ok = g_G_OrigCreateProcessW(appName, cmdLine, procAttr, thrAttr, inheritHandles,
+                                    forcedFlags, env, curDir, si, pi);
+    }
+    if (ok && pi && pi->hProcess && pi->hThread) {
+        // Log what exe is being spawned (appName may be null if exe is in cmdLine)
+        char exeLog[260] = "<embedded in cmdLine>";
+        if (appName) WideCharToMultiByte(CP_ACP, 0, appName, -1, exeLog, 260, nullptr, nullptr);
+        Log("[GOPHER] CreateProcessW intercepted pid=%u exe=%s — injecting DLL",
+            pi->dwProcessId, exeLog);
+        InjectSelfInto(pi->hProcess, pi->hThread);
+        // Only resume if the caller didn't originally ask for suspended.
+        if ((flags & CREATE_SUSPENDED) == 0) ResumeThread(pi->hThread);
+    }
+    return ok;
+}
+
+static BOOL WINAPI HookedCreateProcessA_Gopher(
+    LPCSTR appName, LPSTR cmdLine, LPSECURITY_ATTRIBUTES procAttr,
+    LPSECURITY_ATTRIBUTES thrAttr, BOOL inheritHandles, DWORD flags,
+    LPVOID env, LPCSTR curDir, LPSTARTUPINFOA si, LPPROCESS_INFORMATION pi)
+{
+    DWORD forcedFlags = flags | CREATE_SUSPENDED;
+    BOOL ok = FALSE;
+    if (g_G_CPAAddr) {
+        DWORD op;
+        VirtualProtect(g_G_CPAAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_CPAAddr, g_G_CPAOrig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_CPAAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_CPAAddr, HOOK_JMP_SIZE, op, &op);
+        ok = g_G_OrigCreateProcessA(appName, cmdLine, procAttr, thrAttr, inheritHandles,
+                                    forcedFlags, env, curDir, si, pi);
+        VirtualProtect(g_G_CPAAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_G_CPAAddr, g_G_CPAJmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_G_CPAAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_G_CPAAddr, HOOK_JMP_SIZE, op, &op);
+    } else {
+        ok = g_G_OrigCreateProcessA(appName, cmdLine, procAttr, thrAttr, inheritHandles,
+                                    forcedFlags, env, curDir, si, pi);
+    }
+    if (ok && pi && pi->hProcess && pi->hThread) {
+        Log("[GOPHER] CreateProcessA intercepted pid=%u — injecting DLL", pi->dwProcessId);
+        InjectSelfInto(pi->hProcess, pi->hThread);
+        if ((flags & CREATE_SUSPENDED) == 0) ResumeThread(pi->hThread);
+    }
+    return ok;
+}
+
+static bool InstallGopherChildProcessHook() {
+    HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hK32) { Log("[GOPHER] kernel32.dll not loaded!? cannot hook CreateProcess"); return false; }
+    g_G_OrigCreateProcessW = (PFN_CreateProcessW)GetProcAddress(hK32, "CreateProcessW");
+    g_G_OrigCreateProcessA = (PFN_CreateProcessA)GetProcAddress(hK32, "CreateProcessA");
+    if (g_G_OrigCreateProcessW) {
+        g_G_CPWAddr = (BYTE*)g_G_OrigCreateProcessW;
+        if (InstallHookAt(g_G_CPWAddr, g_G_CPWOrig, g_G_CPWJmp, (void*)HookedCreateProcessW_Gopher))
+            Log("[GOPHER] CreateProcessW hooked at 0x%p", (void*)g_G_CPWAddr);
+        else { Log("[GOPHER] WARN: CreateProcessW hook failed"); g_G_CPWAddr = nullptr; }
+    }
+    if (g_G_OrigCreateProcessA) {
+        g_G_CPAAddr = (BYTE*)g_G_OrigCreateProcessA;
+        if (InstallHookAt(g_G_CPAAddr, g_G_CPAOrig, g_G_CPAJmp, (void*)HookedCreateProcessA_Gopher))
+            Log("[GOPHER] CreateProcessA hooked at 0x%p", (void*)g_G_CPAAddr);
+        else { Log("[GOPHER] WARN: CreateProcessA hook failed"); g_G_CPAAddr = nullptr; }
+    }
+    return g_G_CPWAddr || g_G_CPAAddr;
+}
+
+// ── Check if command line contains a ROM file (direct "Open with" launch) ─
+// When the user right-clicks a ROM and chooses "Open with > Gopher64", explorer
+// launches gopher64.exe directly with the ROM path as an argument.  In this case
+// there is no Gopher64 launcher parent — Gopher64 runs fully in-process as a
+// renderer.  Detecting a ROM extension in the command line is the reliable signal.
+static bool Gopher_HasRomInCommandLine() {
+    const wchar_t* cmdLine = GetCommandLineW();
+    if (!cmdLine) return false;
+
+    // N64 ROM extensions Gopher64 can open.
+    static const wchar_t* kExts[] = {
+        L".n64", L".v64", L".z64", L".rom", L".ndd",
+        L".N64", L".V64", L".Z64", L".ROM", L".NDD",
+        nullptr
+    };
+    for (int i = 0; kExts[i]; ++i) {
+        if (wcsstr(cmdLine, kExts[i])) {
+            Log("[GOPHER] ROM extension '%ls' found in command line — direct launch detected", kExts[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Check if we are the child renderer (parent has same exe name) ────────
+static bool Gopher_IsChildRenderer() {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+    DWORD myPid = GetCurrentProcessId();
+    DWORD parentPid = 0;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == myPid) { parentPid = pe.th32ParentProcessID; break; }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    if (!parentPid) return false;
+
+    // Query parent exe path
+    wchar_t parentPath[MAX_PATH] = {}; DWORD pLen = MAX_PATH;
+    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+    if (!hParent) return false;
+    BOOL okP = QueryFullProcessImageNameW(hParent, 0, parentPath, &pLen);
+    CloseHandle(hParent);
+    if (!okP) return false;
+
+    wchar_t myPath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, myPath, MAX_PATH)) return false;
+
+    const wchar_t* pName = wcsrchr(parentPath, L'\\'); pName = pName ? pName+1 : parentPath;
+    const wchar_t* mName = wcsrchr(myPath,     L'\\'); mName = mName ? mName+1 : myPath;
+    bool sameName = (_wcsicmp(pName, mName) == 0);
+    Log("[GOPHER] Parent pid=%u exe=%ls | me pid=%u exe=%ls | same=%d",
+        parentPid, pName, myPid, mName, sameName?1:0);
+    return sameName;
+}
+
+// ── Gopher parallel worker thread ────────────────────────────────────────
+static DWORD GopherHookThread() {
+    Log("[GOPHER] GopherHookThread started");
+
+    // Detect role: renderer vs launcher.
+    //
+    // Two cases where we ARE the renderer and must install the Present hook:
+    //   1. Normal flow:     parent exe == our exe (same=1) — Gopher64 launcher
+    //                       spawned us as the child renderer process.
+    //   2. "Open with" flow: explorer launched us directly with a ROM path as
+    //                       argument (parent=explorer, same=0) — no separate
+    //                       launcher exists; we ARE the renderer from the start.
+    //
+    // In the standard launcher flow with NO ROM arg, same=0 correctly means
+    // "we are the GUI launcher; skip Present hook to avoid GPU deadlock."
+    bool isChild   = Gopher_IsChildRenderer();
+    bool hasRomArg = !isChild && Gopher_HasRomInCommandLine();
+
+    if (isChild) {
+        Log("[GOPHER] Parent has same exe name — we are the CHILD renderer → install Present hook");
+    } else if (hasRomArg) {
+        Log("[GOPHER] Direct launch with ROM argument (Open with / CLI) — treating as renderer → install Present hook");
+        isChild = true; // renderer path from here on
+    } else {
+        Log("[GOPHER] Parent has different exe name — we appear to be the LAUNCHER (GUI)");
+    }
+
+    // Always install CreateProcess hook (both parent and child — cheap, idempotent).
+    InstallGopherChildProcessHook();
+
+    // Pre-compile shaders unconditionally (takes 0.5-2s, background thread).
+    // Done here so InitResources (inside Present hook) is instantaneous.
+    // Also allows the fallback d3d11 check below to see if we're really a renderer.
+    if (!Gopher_PrecompileShaders()) {
+        Log("[GOPHER] FATAL: shader pre-compile failed — effects will be disabled");
+        return 0;
+    }
+
+    // If parent-name detection said "launcher", skip Present hook.
+    // The LAUNCHER (parent=explorer.exe) uses wgpu/D3D11 for its own ROM-browser
+    // UI — it loads d3d11+dxgi for itself. Installing the Present hook there causes
+    // a GPU deadlock when DXGI transitions between fullscreen and windowed modes
+    // (Present blocks in DWM while our GPU draw is in-flight on the same device).
+    // All observed child renderers correctly detect same=1, so no fallback needed.
+    if (!isChild) {
+        Log("[GOPHER] Launcher mode — Present hook SKIPPED (parent is not a Gopher64 process)");
+        return 0;
+    }
+
+    // No explicit sleep needed — Gopher_PrecompileShaders() already takes ~150ms
+    // (with skip-optimisation flag), giving wgpu enough time to load d3d11/dxgi.
+    // The retry loop below handles the rare case where wgpu initialises slower.
+    bool ok = SafeInstallGopher64Hook();
+    Log("[GOPHER] Initial Present hook install: %s", ok ? "OK" : "failed");
+    if (!ok) {
+        for (int i = 0; i < 30; i++) {
+            Sleep(1000);
+            ok = SafeInstallGopher64Hook();
+            if (ok) { Log("[GOPHER] Present hook installed at T+~%ds", i + 2); break; }
+        }
+    }
+    Log("[GOPHER] GopherHookThread done (hookInstalled=%s)", ok?"yes":"no");
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 //  D3D9 HOOK (for games/emulators using Direct3D 9)
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -2690,6 +5229,24 @@ static IDirect3DDevice9*   g_D3D9Device        = nullptr;
 static IDirect3DPixelShader9*  g_D3D9PS        = nullptr;
 static IDirect3DVertexShader9* g_D3D9VS        = nullptr;
 static IDirect3DTexture9*  g_D3D9BBCopy        = nullptr;
+// MegaBezel bezel PNG texture (D3D9). Loaded via WIC the first time the
+// shared-memory path changes; bound to sampler s1 alongside the backbuffer
+// copy on s0. Mirrors g_BezelTex / g_BezelSRV from the D3D11 path.
+static IDirect3DTexture9*  g_D3D9BezelTex      = nullptr;
+// Auto-detected game content bounds in UV space [0..1]. Used by MegaBezel
+// reflection shader to ignore in-game letterbox/pillarbox black bars when
+// sampling the reflection — so 4:3 / unusual ratios reflect the actual game
+// pixels instead of the black bars around them.
+static IDirect3DSurface9*  g_D3D9DetectRT      = nullptr;  // 64x36 DEFAULT RT
+static IDirect3DSurface9*  g_D3D9DetectSys     = nullptr;  // 64x36 SYSTEMMEM
+static const UINT          DETECT_W            = 64;
+static const UINT          DETECT_H            = 36;
+static float               g_GameBoundsL       = 0.0f;
+static float               g_GameBoundsT       = 0.0f;
+static float               g_GameBoundsR       = 1.0f;
+static float               g_GameBoundsB       = 1.0f;
+static int                 g_DetectFrame       = 0;
+static wchar_t             g_D3D9BezelPathCached[260] = {};
 static UINT                g_D3D9LastW = 0, g_D3D9LastH = 0;
 static bool                g_D3D9Inited        = false;
 static bool                g_D3D9HasCapture    = false; // true if g_D3D9BBCopy has valid scene data captured at EndScene
@@ -2737,26 +5294,38 @@ static BYTE  g_D3D9CreateDeviceExJmp[14]  = {};
 static bool  g_D3D9DeferredHookActive   = false;
 
 // D3D9 HLSL pixel shader — CRT scanline mask + optional Gaussian blur
-// c0 = (screenW, screenH, hThickness, hGap)
-// c1 = (hOpacity, hStartX, hWidth, hEnabled)
-// c2 = (vThickness, vGap, vOpacity, vStartY)
-// c3 = (vHeight, vEnabled, blurEnabled, blurIntensity)
-// c4 = (bloomEnabled, bloomIntensity, curvatureEnabled, curvatureIntensity)
-// c8 = (vhsEnabled, vhsIntensity, grainIntensity, 0)
-// c9 = (tapeNoiseEnabled, tapeNoiseIntensity, 0, 0)
+// c0  = (screenW, screenH, hThickness, hGap)
+// c1  = (hOpacity, hStartX, hWidth, hEnabled)
+// c2  = (vThickness, vGap, vOpacity, vStartY)
+// c3  = (vHeight, vEnabled, blurEnabled, blurIntensity)
+// c4  = (bloomEnabled, bloomIntensity, curvatureEnabled, curvatureIntensity)
+// c5  = (brightness, contrast, saturation, temperature)
+// c6  = (flickerEnabled, flickerIntensity, time, flickerRate)
+// c7  = (blackLevel, gamma, phosphorEnabled, phosphorIntensity)
+// c8  = (vhsEnabled, vhsIntensity, grainIntensity, 0)
+// c9  = (tapeNoiseEnabled, tapeNoiseIntensity, vignetteEnabled, 0)
+// c10 = (megaBezelEnabled, megaBezelThickness, megaBezelOpacity, megaBezelBlur)
+// c11 = (megaBezelRadius, megaBezelReflectionWidth, megaBezelStartFade, _pad)
+// c12 = (bezelHookActive, bezelHookOpacity, _pad, _pad)
 static const char* D3D9_PS_SRC = R"(
-sampler2D backBuf : register(s0);
+sampler2D backBuf  : register(s0);
+sampler2D bezelTex : register(s1);
 
-float4 cb0 : register(c0);
-float4 cb1 : register(c1);
-float4 cb2 : register(c2);
-float4 cb3 : register(c3);
-float4 cb4 : register(c4);
-float4 cb5 : register(c5);
-float4 cb6 : register(c6);
-float4 cb7 : register(c7);
-float4 cb8 : register(c8);
-float4 cb9 : register(c9);
+float4 cb0  : register(c0);
+float4 cb1  : register(c1);
+float4 cb2  : register(c2);
+float4 cb3  : register(c3);
+float4 cb4  : register(c4);
+float4 cb5  : register(c5);
+float4 cb6  : register(c6);
+float4 cb7  : register(c7);
+float4 cb8  : register(c8);
+float4 cb9  : register(c9);
+float4 cb10 : register(c10);
+float4 cb11 : register(c11);
+float4 cb12 : register(c12);
+float4 cb13 : register(c13);
+float4 cb14 : register(c14);
 
 float tnHash9(float n) { return frac(sin(n) * 43758.5453123); }
 float tnN3d9(float3 x) {
@@ -2803,17 +5372,197 @@ float2 CurveUV(float2 uv, float strength) {
 
 float4 main(float2 vpos : VPOS, float2 uv : TEXCOORD0) : COLOR {
     // cb4.z = curvatureEnabled, cb4.w = curvatureIntensity
+    // cb10.x = megaBezelEnabled (mirror reflection in border zone)
     // Scanlines stay in screen-space (vpos) — never warp with barrel distortion
     float2 sampleUV = uv;
     float2 scanPos  = vpos;
     bool curved = cb4.z >= 0.5 && cb4.w > 0.0;
+    bool megaBz = cb10.x >= 0.5;
 
-    if (curved) {
+    // MegaBezel ON: ALWAYS shrink first so the resize slider always controls
+    // the visible game viewport size, even when curvature is active. Curvature
+    // (if on) is then applied INSIDE the shrunken viewport.
+    // MegaBezel OFF + curvature ON: classic full-screen curvature (no shrink).
+    if (megaBz) {
+        float margin = cb10.y * 0.10;
+        if (margin < 0.001) margin = 0.001;
+        sampleUV.x = (uv.x - margin) / (1.0 - 2.0 * margin);
+        sampleUV.y = (uv.y - margin) / (1.0 - 2.0 * margin);
+        if (curved) {
+            sampleUV = CurveUV(sampleUV, cb4.w * 0.25);
+        }
+    } else if (curved) {
         sampleUV = CurveUV(uv, cb4.w * 0.25);
-        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0)
-            return float4(0, 0, 0, 1);
     }
 
+    // Rounded-rect SDF for the inner game viewport — works identically with or
+    // without curvature since both produce sampleUV. The radius rounds the
+    // visible corners of the game in both modes.
+    // REFL. RADIUS (cb11.x = megaBezelRadius) — rounds the reflection's INNER corner
+    // so it hugs a rounded CRT bezel PNG. 0 = square (original); higher rounds and
+    // lets the reflection overflow inward over the game corner. Independent of GAME
+    // CORNERS (cb9.z), which only rounds the in-game black mask below.
+    float  mbR       = cb11.x * 0.025;
+    float2 mbCV      = sampleUV - 0.5;
+    float2 mbHalfExt = float2(0.5, 0.5);
+    float2 mbQ       = abs(mbCV) - mbHalfExt + mbR;
+    float  mbSDF     = length(max(mbQ, 0.0)) + min(max(mbQ.x, mbQ.y), 0.0) - mbR;
+
+    // Reflection boundary = SQUARE (clean miter, no fan). Game corners rounded
+    // separately below (REFL. RADIUS hard mask).
+    bool outsideGame = megaBz ? (mbSDF > 0.0)
+                    : (sampleUV.x < 0.0 || sampleUV.x > 1.0
+                    || sampleUV.y < 0.0 || sampleUV.y > 1.0);
+
+    if (outsideGame) {
+        if (megaBz) {
+            // ── Picture-frame mirror reflection ──
+            // Sides: 45 deg miter (clean diagonal at corners — like a wood frame).
+            // Rounded corners: radial mirror across the arc, smooth and seamless.
+            float2 mUV;
+            float bezelDepth;
+            // Side (miter) reflection
+            float depthX = sampleUV.x < 0.0 ? -sampleUV.x
+                         : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;
+            float depthY = sampleUV.y < 0.0 ? -sampleUV.y
+                         : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;
+            bool sInSide = depthX > 0.0;
+            bool sInTopBot = depthY > 0.0;
+            float2 mUV_side;
+            if (sInSide && sInTopBot) {
+                if (depthX >= depthY) {
+                    mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;
+                    mUV_side.y = saturate(sampleUV.y);
+                } else {
+                    mUV_side.x = saturate(sampleUV.x);
+                    mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;
+                }
+            } else if (sInSide) {
+                mUV_side.x = sampleUV.x < 0.0 ? -sampleUV.x : 2.0 - sampleUV.x;
+                mUV_side.y = saturate(sampleUV.y);
+            } else {
+                mUV_side.x = saturate(sampleUV.x);
+                mUV_side.y = sampleUV.y < 0.5 ? -sampleUV.y : 2.0 - sampleUV.y;
+            }
+            float bezelDepth_side = max(depthX, depthY);
+
+            // Corner (radial through arc) reflection
+            float2 arcCenter = sign(mbCV) * (mbHalfExt - mbR);
+            float2 u         = mbCV - arcCenter;
+            float  distU     = max(length(u), 1e-5);
+            float2 mCV       = arcCenter + u * (2.0 * mbR - distU) / distU;
+            float2 mUV_corner = mCV + 0.5;
+            float bezelDepth_corner = max(distU - mbR, 0.0);
+
+            // Smooth blend between miter and radial — eliminates the seam
+            // visible at the side↔corner boundary (the 45° "cut" the user saw).
+            // Pure 45° miter (radial corner mirror disabled — it caused the
+            // "peacock fan" artifact on bright game-corner content).
+            float blendCorner = 0.0;
+            bezelDepth = lerp(bezelDepth_side, bezelDepth_corner, blendCorner);
+            // ── Per-axis mirror across the ROUNDED game edge (radius mbR = REFL. RADIUS) ──
+            // Mirror each axis across the rounded-edge position (arc in the corner,
+            // straight elsewhere). The 45-deg split fills the rounded-off corner with the
+            // two side reflections meeting at the diagonal — axis-aligned, NO radial fan.
+            float2 cR    = sampleUV - 0.5;
+            float2 sgnR  = sign(cR);
+            float2 aR    = abs(cR);
+            float  arcCo = 0.5 - mbR;
+            float  xEdge = (aR.y > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.y-arcCo)*(aR.y-arcCo), 0.0))) : 0.5;
+            float  yEdge = (aR.x > arcCo) ? (arcCo + sqrt(max(mbR*mbR - (aR.x-arcCo)*(aR.x-arcCo), 0.0))) : 0.5;
+            float  depthXr = aR.x - xEdge;
+            float  depthYr = aR.y - yEdge;
+            float2 aM_X   = float2(2.0*xEdge - aR.x, aR.y);
+            float2 aM_Y   = float2(aR.x, 2.0*yEdge - aR.y);
+            float  blendW = max(mbR * 0.6, 1e-4);          // soft diagonal blend (tunable: bigger = smoother)
+            float2 aM     = lerp(aM_Y, aM_X, smoothstep(-blendW, blendW, depthXr - depthYr));
+            mUV = saturate(0.5 + sgnR * aM);
+            // Remap mUV from full backbuffer [0,1] to the auto-detected game
+            // content area cb14 = (boundsL, boundsT, boundsR, boundsB). This
+            // skips in-game letterbox/pillarbox black bars (4:3, etc.) so the
+            // reflection samples the actual game pixels.
+            mUV.x = lerp(cb14.x, cb14.z, mUV.x);
+            mUV.y = lerp(cb14.y, cb14.w, mUV.y);
+            // 7x7 Gaussian blur (or single sample if blur off)
+            float mbSigma = cb10.w * 5.0 + 0.0001;
+            float2 mbTexel = 1.0 / float2(cb0.x, cb0.y);
+            float3 reflColor;
+            if (mbSigma > 0.05) {
+                float3 sum = float3(0, 0, 0);
+                float wSum = 0.0;
+                for (int dy = -3; dy <= 3; dy++) {
+                    for (int dx = -3; dx <= 3; dx++) {
+                        float d2 = float(dx*dx + dy*dy);
+                        float w = exp(-d2 / (2.0 * mbSigma * mbSigma));
+                        sum += tex2D(backBuf, saturate(mUV + float2(dx, dy) * mbTexel * mbSigma)).rgb * w;
+                        wSum += w;
+                    }
+                }
+                reflColor = sum / wSum;
+            } else {
+                reflColor = tex2D(backBuf, mUV).rgb;
+            }
+            // Reflection width + fade (curved-depth per-axis, miter-aligned)
+            float marginRef     = max(cb10.y * 0.10, 0.001);
+            float gameWpx       = max(cb0.x * (1.0 - 2.0 * marginRef), 1.0);
+            float gameHpx       = max(cb0.y * (1.0 - 2.0 * marginRef), 1.0);
+            float reflW         = max(cb11.y, 0.001);
+            float invShrink     = 1.0 / max(1.0 - 2.0 * marginRef, 1e-5);
+            float curvStrength  = curved ? cb4.w * 0.25 : 0.0;
+            float2 sUV_left  = float2((0.0 - marginRef) * invShrink,
+                                       (uv.y - marginRef) * invShrink);
+            float2 sUV_right = float2((1.0 - marginRef) * invShrink,
+                                       (uv.y - marginRef) * invShrink);
+            float2 sUV_top   = float2((uv.x - marginRef) * invShrink,
+                                       (0.0 - marginRef) * invShrink);
+            float2 sUV_bot   = float2((uv.x - marginRef) * invShrink,
+                                       (1.0 - marginRef) * invShrink);
+            float2 csu_left  = curved ? CurveUV(sUV_left,  curvStrength) : sUV_left;
+            float2 csu_right = curved ? CurveUV(sUV_right, curvStrength) : sUV_right;
+            float2 csu_top   = curved ? CurveUV(sUV_top,   curvStrength) : sUV_top;
+            float2 csu_bot   = curved ? CurveUV(sUV_bot,   curvStrength) : sUV_bot;
+            float depthXc = sampleUV.x < 0.0 ? -sampleUV.x
+                          : sampleUV.x > 1.0 ? sampleUV.x - 1.0 : 0.0;
+            float depthYc = sampleUV.y < 0.0 ? -sampleUV.y
+                          : sampleUV.y > 1.0 ? sampleUV.y - 1.0 : 0.0;
+            float maxDepthX = sampleUV.x < 0.0 ? -csu_left.x
+                            : sampleUV.x > 1.0 ? csu_right.x - 1.0 : 1.0;
+            float maxDepthY = sampleUV.y < 0.0 ? -csu_top.y
+                            : sampleUV.y > 1.0 ? csu_bot.y - 1.0 : 1.0;
+            float aspect = cb0.x / max(cb0.y, 1.0);
+            float xFadeScale = max(1.0 / aspect, 1.0);
+            float yFadeScale = max(aspect, 1.0);
+            // Ray-rect intersection from arcCenter (inset corner) — distance
+            // arcCenter→screenEdge along X = mbR + maxDepthX (idem Y).
+            float2 dirCorn = u / max(distU, 1e-5);
+            float corMaxX = (maxDepthX + mbR) / max(abs(dirCorn.x), 0.01);
+            float corMaxY = (maxDepthY + mbR) / max(abs(dirCorn.y), 0.01);
+            float corMaxRef = max(min(corMaxX, corMaxY) - mbR, 1e-5);
+            float normDepth_corner = saturate(bezelDepth_corner / max(corMaxRef * reflW, 1e-5));
+            float dxN = depthXc / max(maxDepthX * xFadeScale, 1e-5);
+            float dyN = depthYc / max(maxDepthY * yFadeScale, 1e-5);
+            float normDepth_side = saturate(max(dxN, dyN) / reflW);
+            float normDepth = lerp(normDepth_side, normDepth_corner, blendCorner);
+            float fade = 1.0 - normDepth;
+            fade = fade * fade;
+            float startFade = saturate(cb11.z);
+            float3 reflected = reflColor * cb10.z * fade * startFade;
+            if (cb12.x >= 0.5) {
+                float4 bz = tex2D(bezelTex, uv);
+                bz.rgb *= cb12.y;
+                float ra = cb10.z * fade * startFade;
+                return float4(reflected + bz.rgb * bz.a * (1.0 - ra), 1.0);
+            }
+            return float4(reflected, 1.0);
+        }
+        // Curvature with no MegaBezel: black outside (matches existing behavior).
+        if (curved) return float4(0, 0, 0, 1);
+    }
+)";
+
+// D3D9_PS_SRC2: remainder of pixel shader main() — split to stay under the
+// MSVC raw-string-literal size limit (~16 KB per token).
+static const char* D3D9_PS_SRC2 = R"(
     float mask = 1.0;
     float fwY = fwidth(scanPos.y);
     float fwX = fwidth(scanPos.x);
@@ -2842,23 +5591,29 @@ float4 main(float2 vpos : VPOS, float2 uv : TEXCOORD0) : COLOR {
                 || abs(cb5.z) > 0.001 || abs(cb5.w) > 0.001
                 || cb7.x > 0.001 || abs(cb7.y - 1.0) > 0.001
                 || cb8.x >= 0.5 || cb8.z > 0.001 || cb9.x >= 0.5
-                || cb9.z >= 0.5;
+                || cb9.z > 0.0 || megaBz || cb12.x >= 0.5 || cb13.x >= 0.5;
     if (!needTex) {
-        if (cb9.z >= 0.5) {
-            float  r    = 0.04;
+        if (cb9.z > 0.0) {
+            float  r    = max(cb9.z * 0.10, 0.022);  // radius floored at fade width (gradient unchanged)
             float2 qv   = abs(uv - 0.5) - 0.5 + r;
             float  rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;
             float2 outN;
             if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);
             else if (qv.x > 0.0)          outN = float2(1.0, 0.0);
             else                           outN = float2(0.0, 1.0);
-            float fadeW = length(float2(outN.x * 0.012, outN.y * 0.033));
+            float fadeW = length(float2(outN.x * 0.008, outN.y * 0.020));
             mask *= smoothstep(0.0, fadeW, -rSDF);
         }
         return float4(mask, mask, mask, 1.0);
     }
 
     float2 texel = 1.0 / float2(cb0.x, cb0.y);
+
+    // NOTE: previous versions cropped 2% off the game's top/bottom here to hide
+    // the game's intrinsic letterbox. That hardcoded crop also stretched games
+    // WITHOUT letterbox, eating HUD pixels. Removed: the game is now sampled
+    // unstretched at its original aspect. Letterbox detection is handled by the
+    // reflection sampler (cb14 bounds) so reflection still uses real game pixels.
     float4 color = tex2D(backBuf, sampleUV);
 
     // Gaussian blur (must run before B/C/S/T — blur re-samples original texture)
@@ -2963,6 +5718,11 @@ float4 main(float2 vpos : VPOS, float2 uv : TEXCOORD0) : COLOR {
     if (cb8.x >= 0.5 && uv.y <= 0.96) {
         float inten = cb8.y;
         float t9    = cb6.z;
+        // outsideGame: follows curvature + MegaBezel resize boundary exactly.
+        // cb14: further clips to detected game content (handles emulator letterbox).
+        float contentMask9 = (!outsideGame &&
+                              uv.x >= cb14.x && uv.x <= cb14.z &&
+                              uv.y >= cb14.y && uv.y <= cb14.w) ? 1.0 : 0.0;
 
         // — 1. LINE JITTER: sparse spike lines only (no global sinusoidal shift) —
         float lineIdx9 = floor(uv.y * 720.0);
@@ -2976,18 +5736,18 @@ float4 main(float2 vpos : VPOS, float2 uv : TEXCOORD0) : COLOR {
         float luma09  = dot(s09.rgb, float3(0.299, 0.587, 0.114));
         float chrMag9 = saturate(length(s09.rgb - luma09) * 2.5);
         float dotPhi9 = (uv.x * 240.0 + floor(t9 * 29.97) * 0.5) * 3.14159265;
-        output.r += sin(dotPhi9)         * inten * 0.008 * chrMag9;
-        output.b += sin(dotPhi9 + 1.047) * inten * 0.006 * chrMag9;
+        output.r += sin(dotPhi9)         * inten * 0.008 * chrMag9 * contentMask9;
+        output.b += sin(dotPhi9 + 1.047) * inten * 0.006 * chrMag9 * contentMask9;
 
         // — 4. LUMA NOISE: horizontal tape hiss streaks —
         float ny9     = floor(uv.y * 200.0);
         float nx9     = floor(uv.x * 15.0);
         float nt9     = floor(t9 * 25.0);
         float streak9 = frac(sin(dot(float2(nx9 + ny9 * 200.0, nt9), float2(127.1, 311.7))) * 43758.5) - 0.5;
-        output.rgb   += streak9 * inten * 0.022;
+        output.rgb   += streak9 * inten * 0.022 * contentMask9;
 
         // — 5. HEAD-SWITCHING BAND: bottom ~3% of screen, mechanical artifact —
-        float headZone9 = smoothstep(0.97, 1.00, uv.y);
+        float headZone9 = smoothstep(0.97, 1.00, uv.y) * contentMask9;
         float headH9    = frac(sin(floor(uv.y * 300.0) * 127.1 + floor(t9 * 30.0) * 311.7) * 43758.5);
         float headOff9  = (headH9 - 0.5) * inten * 0.030;
         float4 headS9   = tex2D(backBuf, jUV9 + float2(headOff9, 0.0));
@@ -2995,54 +5755,325 @@ float4 main(float2 vpos : VPOS, float2 uv : TEXCOORD0) : COLOR {
 
         // — 6. COLOR GRADING: desaturation + luma lift + warm shadows —
         float vLuma9 = dot(output.rgb, float3(0.299, 0.587, 0.114));
-        output.rgb   = lerp(output.rgb, float3(vLuma9, vLuma9, vLuma9), inten * 0.25);
-        output.rgb  *= lerp(1.0, 1.06, inten);          // analog luma lift
-        output.r    += inten * 0.020 * (1.0 - vLuma9);  // warm shadows
-        output.b    -= inten * 0.014 * (1.0 - vLuma9);
+        output.rgb   = lerp(output.rgb, float3(vLuma9, vLuma9, vLuma9), inten * 0.25 * contentMask9);
+        output.rgb  *= lerp(1.0, 1.06, inten * contentMask9);          // analog luma lift
+        output.r    += inten * 0.020 * (1.0 - vLuma9) * contentMask9;  // warm shadows
+        output.b    -= inten * 0.014 * (1.0 - vLuma9) * contentMask9;
         output       = saturate(output);
     }
 
-    // Film Grain — organic clumped grain (film-like, not digital noise)
+    // Film Grain — true per-pixel noise, hash without sine (no periodic banding)
     if (cb8.z > 0.001) {
-        float  lum9g = dot(output.rgb, float3(0.299, 0.587, 0.114));
-        float2 tO9   = floor(cb6.z * 24.0) * float2(17.0, 13.0);
-        float2 gc9   = floor(vpos * 0.5 + tO9);
-        float  g09   = frac(sin(dot(gc9,               float2(127.1, 311.7))) * 43758.5453) - 0.5;
-        float  g19   = frac(sin(dot(gc9 + float2(1,0), float2(311.7,  92.9))) * 43758.5453) - 0.5;
-        float  g29   = frac(sin(dot(gc9 + float2(0,1), float2( 92.9, 213.7))) * 43758.5453) - 0.5;
-        float2 gf9   = floor(vpos + tO9 * 1.3);
-        float gFn9   = frac(sin(dot(gf9, float2(213.7, 127.1))) * 43758.5453) - 0.5;
-        float grain9 = (g09 + g19 + g29) * 0.333 * 0.65 + gFn9 * 0.35;
-        float amp9   = 1.0 - (2.0 * lum9g - 1.0) * (2.0 * lum9g - 1.0) * 0.55;
-        output.rgb  += grain9 * cb8.z * 0.22 * amp9;
+        float grainMask9 = (!outsideGame &&
+                            uv.x >= cb14.x && uv.x <= cb14.z &&
+                            uv.y >= cb14.y && uv.y <= cb14.w) ? 1.0 : 0.0;
+        float lum9g  = dot(output.rgb, float3(0.299, 0.587, 0.114));
+        float3 p39   = frac(float3(vpos, floor(cb6.z * 24.0) + 1.0)
+                          * float3(0.1031, 0.1030, 0.0973));
+        p39         += dot(p39, p39.yzx + 33.33);
+        float grain9 = frac((p39.x + p39.y) * p39.z) * 2.0 - 1.0;
+        float amp9   = 1.0 - (2.0 * lum9g - 1.0) * (2.0 * lum9g - 1.0);
+        output.rgb  += grain9 * cb8.z * 0.18 * amp9 * grainMask9;
         output       = saturate(output);
     }
 
     // Tape Noise — libretro-style analog tape interference spikes
     // cb9.x = tapeNoiseEnabled, cb9.y = tapeNoiseIntensity
     if (cb9.x >= 0.5) {
+        float tnMask9 = (!outsideGame &&
+                         uv.x >= cb14.x && uv.x <= cb14.z &&
+                         uv.y >= cb14.y && uv.y <= cb14.w) ? 1.0 : 0.0;
         float fc9    = cb6.z * 24.0;
         float2 tnUV9 = uv * cb0.y * 4.0;
         float col9   = tnNn9(tnUV9, fc9);
-        output.rgb  += clamp(float3(col9, col9, col9), 0.0, 0.5) * cb9.y;
+        output.rgb  += clamp(float3(col9, col9, col9), 0.0, 0.5) * cb9.y * tnMask9;
         output       = saturate(output);
     }
 
-    if (cb9.z >= 0.5) {
-        float  r    = 0.04;
+    if (cb9.z > 0.0) {
+        float  r    = max(cb9.z * 0.10, 0.022);  // radius floored at fade width (gradient unchanged)
         float2 qv   = abs(sampleUV - 0.5) - 0.5 + r;
         float  rSDF = length(max(qv, 0.0)) + min(max(qv.x, qv.y), 0.0) - r;
         float2 outN;
         if (qv.x > 0.0 && qv.y > 0.0) outN = normalize(qv);
         else if (qv.x > 0.0)          outN = float2(1.0, 0.0);
         else                           outN = float2(0.0, 1.0);
-        float fadeW = length(float2(outN.x * 0.012, outN.y * 0.033));
+        float fadeW = length(float2(outN.x * 0.008, outN.y * 0.020));
         output.rgb *= smoothstep(0.0, fadeW, -rSDF);
+    }
+
+    // REFL. RADIUS: hard-mask the rounded-off game corner to black (bezel covers).
+    // mbSDF = rounded-rect SDF with radius mbR (= cb11.x = REFL. RADIUS); >0 only
+    // in the corner triangle, 0 on straight edges. No-op when REFL. RADIUS=0.
+    if (megaBz && mbSDF > 0.0) output.rgb = float3(0.0, 0.0, 0.0);
+
+    // Bezel PNG overlay (inside-game pixels). Standard alpha "over" composite
+    // so the bezel art layers ON TOP of the rendered game frame. Reflection
+    // pixels in the border zone already returned earlier with bezel composited.
+    if (cb12.x >= 0.5) {
+        float4 bz = tex2D(bezelTex, uv);
+        float a = bz.a * cb12.y;
+        output.rgb = output.rgb * (1.0 - a) + bz.rgb * a;
     }
 
     return output;
 }
 )";
+
+// ── Combined D3D9 PS source (D3D9_PS_SRC + D3D9_PS_SRC2) — built once ────
+// Mirrors GetPSSrc() for D3D11. Each part is a separate static const char*
+// declaration so neither exceeds the MSVC raw-string-literal size limit.
+static char* g_D3D9_PS_SRC_FULL = nullptr;
+static const char* GetD3D9PSSrc() {
+    if (!g_D3D9_PS_SRC_FULL) {
+        size_t l1 = strlen(D3D9_PS_SRC), l2 = strlen(D3D9_PS_SRC2);
+        g_D3D9_PS_SRC_FULL = (char*)malloc(l1 + l2 + 1);
+        if (g_D3D9_PS_SRC_FULL) {
+            memcpy(g_D3D9_PS_SRC_FULL,      D3D9_PS_SRC,  l1);
+            memcpy(g_D3D9_PS_SRC_FULL + l1, D3D9_PS_SRC2, l2 + 1);
+        } else {
+            return D3D9_PS_SRC;
+        }
+    }
+    return g_D3D9_PS_SRC_FULL;
+}
+
+// ── D3D9 bezel PNG loader ────────────────────────────────────────────────
+// Mirror of LoadBezelTexture (D3D11). Decodes the PNG via WIC into BGRA bytes
+// (matches D3DFMT_A8R8G8B8 byte order on little-endian) and uploads to a
+// D3DPOOL_MANAGED IDirect3DTexture9. Pool=MANAGED so the texture survives a
+// device Reset transparently — matches the lifetime of the captured bezel
+// path (released only when the path changes or the hook is unloaded).
+static void ReleaseBezelTextureD3D9() {
+    if (g_D3D9BezelTex) { g_D3D9BezelTex->Release(); g_D3D9BezelTex = nullptr; }
+    g_D3D9BezelPathCached[0] = 0;
+}
+
+// Detect the in-game content bounds (excluding black letterbox/pillarbox bars).
+// Downscales the current backbuffer to 64x36 in SYSTEMMEM, scans rows/columns
+// from each edge, returns the first row/column with enough non-black pixels.
+// Bounds are smoothed temporally to avoid jitter on dark scenes.
+static void DetectGameBoundsD3D9(IDirect3DDevice9* dev) {
+    if (!dev) return;
+    if (!g_D3D9DetectRT) {
+        if (FAILED(dev->CreateRenderTarget(DETECT_W, DETECT_H, D3DFMT_A8R8G8B8,
+            D3DMULTISAMPLE_NONE, 0, FALSE, &g_D3D9DetectRT, nullptr))) return;
+    }
+    if (!g_D3D9DetectSys) {
+        if (FAILED(dev->CreateOffscreenPlainSurface(DETECT_W, DETECT_H, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &g_D3D9DetectSys, nullptr))) return;
+    }
+
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    HRESULT hr = dev->StretchRect(bb, nullptr, g_D3D9DetectRT, nullptr, D3DTEXF_LINEAR);
+    bb->Release();
+    if (FAILED(hr)) return;
+    if (FAILED(dev->GetRenderTargetData(g_D3D9DetectRT, g_D3D9DetectSys))) return;
+
+    D3DLOCKED_RECT lr;
+    if (FAILED(g_D3D9DetectSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return;
+
+    BYTE* px    = (BYTE*)lr.pBits;
+    int   pitch = lr.Pitch;
+    const int LUMA_THRESHOLD = 24;          // sum of R+G+B > 24 (~3% intensity)
+    const int MIN_CONTENT    = (int)(DETECT_W * 0.05f); // 5% of pixels in row must be non-black
+
+    auto rowHasContent = [&](int y) -> bool {
+        BYTE* row = px + y * pitch;
+        int n = 0;
+        for (UINT x = 0; x < DETECT_W; x++) {
+            int s = row[x*4 + 0] + row[x*4 + 1] + row[x*4 + 2];
+            if (s > LUMA_THRESHOLD) n++;
+        }
+        return n >= MIN_CONTENT;
+    };
+    auto colHasContent = [&](int x) -> bool {
+        int n = 0;
+        for (UINT y = 0; y < DETECT_H; y++) {
+            BYTE* p = px + y * pitch + x * 4;
+            int s = p[0] + p[1] + p[2];
+            if (s > LUMA_THRESHOLD) n++;
+        }
+        return n >= (int)(DETECT_H * 0.05f);
+    };
+
+    int top = 0;                    while (top < (int)DETECT_H && !rowHasContent(top)) top++;
+    int bot = (int)DETECT_H - 1;    while (bot > top && !rowHasContent(bot)) bot--;
+    int lft = 0;                    while (lft < (int)DETECT_W && !colHasContent(lft)) lft++;
+    int rgt = (int)DETECT_W - 1;    while (rgt > lft && !colHasContent(rgt)) rgt--;
+
+    g_D3D9DetectSys->UnlockRect();
+
+    // Whole screen is black/near-black — keep previous bounds (avoid resetting on fade-outs)
+    if (bot <= top || rgt <= lft) return;
+
+    float newL = (float)lft       / (float)DETECT_W;
+    float newT = (float)top       / (float)DETECT_H;
+    float newR = (float)(rgt + 1) / (float)DETECT_W;
+    float newB = (float)(bot + 1) / (float)DETECT_H;
+
+    // Temporal smoothing: 30% lerp toward new value per detection
+    g_GameBoundsL = g_GameBoundsL * 0.7f + newL * 0.3f;
+    g_GameBoundsT = g_GameBoundsT * 0.7f + newT * 0.3f;
+    g_GameBoundsR = g_GameBoundsR * 0.7f + newR * 0.3f;
+    g_GameBoundsB = g_GameBoundsB * 0.7f + newB * 0.3f;
+}
+
+static bool LoadBezelTextureD3D9(IDirect3DDevice9* dev, const wchar_t* path) {
+    Log("[BEZEL-D3D9] ENTER dev=%p path=%p path[0]=%d", dev, path, (path ? (int)path[0] : -1));
+    ReleaseBezelTextureD3D9();
+    if (!dev || !path || !path[0]) {
+        Log("[BEZEL-D3D9] LoadBezelTextureD3D9 skipped (empty)");
+        return false;
+    }
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    IWICImagingFactory*    wic       = nullptr;
+    IWICBitmapDecoder*     decoder   = nullptr;
+    IWICBitmapFrameDecode* frame     = nullptr;
+    IWICFormatConverter*   converter = nullptr;
+    BYTE*                  pixels    = nullptr;
+    bool ok = false;
+    UINT w = 0, h = 0;
+    UINT stride = 0, imgSize = 0;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step1 CoCreateInstance hr=0x%08X", hr); goto cleanup; }
+    Log("[BEZEL-D3D9] step1 OK wic=%p", wic);
+
+    hr = wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step2 decode '%ls' hr=0x%08X", path, hr); goto cleanup; }
+    Log("[BEZEL-D3D9] step2 OK decoder=%p", decoder);
+
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step3 GetFrame hr=0x%08X", hr); goto cleanup; }
+    hr = wic->CreateFormatConverter(&converter);
+    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step4 CreateFormatConverter hr=0x%08X", hr); goto cleanup; }
+    // D3DFMT_A8R8G8B8 in memory is BGRA byte-order (little-endian DWORDs are 0xAARRGGBB).
+    hr = converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step5 Initialize hr=0x%08X", hr); goto cleanup; }
+
+    {
+        UINT srcW = 0, srcH = 0;
+        converter->GetSize(&srcW, &srcH);
+        if (srcW == 0 || srcH == 0) { Log("[BEZEL-D3D9] FAIL zero src size"); goto cleanup; }
+
+        // Query device caps to honor MaxTextureWidth/Height + power-of-2 requirements.
+        D3DCAPS9 caps = {};
+        dev->GetDeviceCaps(&caps);
+        UINT maxW = caps.MaxTextureWidth  ? caps.MaxTextureWidth  : 2048;
+        UINT maxH = caps.MaxTextureHeight ? caps.MaxTextureHeight : 2048;
+        bool needPow2 = (caps.TextureCaps & D3DPTEXTURECAPS_POW2)
+                      && !(caps.TextureCaps & D3DPTEXTURECAPS_NONPOW2CONDITIONAL);
+
+        UINT tgtW = srcW, tgtH = srcH;
+        if (tgtW > maxW) tgtW = maxW;
+        if (tgtH > maxH) tgtH = maxH;
+        if (needPow2) {
+            UINT p = 1; while (p < tgtW && p < maxW) p <<= 1; tgtW = (p > maxW) ? maxW : p;
+            UINT q = 1; while (q < tgtH && q < maxH) q <<= 1; tgtH = (q > maxH) ? maxH : q;
+        }
+
+        if (tgtW != srcW || tgtH != srcH) {
+            IWICBitmapScaler* scaler = nullptr;
+            HRESULT hsc = wic->CreateBitmapScaler(&scaler);
+            if (SUCCEEDED(hsc) && scaler) {
+                hsc = scaler->Initialize(converter, tgtW, tgtH, WICBitmapInterpolationModeFant);
+                if (SUCCEEDED(hsc)) {
+                    Log("[BEZEL-D3D9] scaling %ux%u -> %ux%u (caps max=%ux%u pow2=%d)",
+                        srcW, srcH, tgtW, tgtH, maxW, maxH, needPow2 ? 1 : 0);
+                    w = tgtW; h = tgtH;
+                    stride  = w * 4;
+                    imgSize = stride * h;
+                    pixels  = new BYTE[imgSize];
+                    hr = scaler->CopyPixels(nullptr, stride, imgSize, pixels);
+                    scaler->Release();
+                    if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL scaler->CopyPixels hr=0x%08X", hr); goto cleanup; }
+                } else {
+                    scaler->Release();
+                    Log("[BEZEL-D3D9] FAIL scaler->Initialize hr=0x%08X", hsc); goto cleanup;
+                }
+            } else {
+                Log("[BEZEL-D3D9] FAIL CreateBitmapScaler hr=0x%08X", hsc); goto cleanup;
+            }
+        } else {
+            w = srcW; h = srcH;
+            stride  = w * 4;
+            imgSize = stride * h;
+            pixels  = new BYTE[imgSize];
+            hr = converter->CopyPixels(nullptr, stride, imgSize, pixels);
+            if (FAILED(hr)) { Log("[BEZEL-D3D9] FAIL step7 CopyPixels hr=0x%08X", hr); goto cleanup; }
+        }
+        Log("[BEZEL-D3D9] step7 OK pixels copied (final %ux%u)", w, h);
+    }
+
+    {
+        // D3D9Ex devices (used by Cyber Shadow et al.) prohibit D3DPOOL_MANAGED.
+        // Use a SYSTEMMEM staging texture (lockable) then UpdateTexture into a
+        // DEFAULT-pool texture (sampleable). The DEFAULT texture is lost on
+        // device Reset — HookedD3D9Reset releases it via D3D9ReleaseOurResources.
+        IDirect3DTexture9* staging = nullptr;
+        HRESULT hr2 = dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        if (FAILED(hr2) || !staging) {
+            Log("[BEZEL-D3D9] FAIL step8a SYSTEMMEM staging hr=0x%08X w=%u h=%u", hr2, w, h);
+            goto cleanup;
+        }
+
+        D3DLOCKED_RECT lr;
+        HRESULT hr3 = staging->LockRect(0, &lr, nullptr, 0);
+        if (FAILED(hr3)) {
+            Log("[BEZEL-D3D9] FAIL step8b staging LockRect hr=0x%08X", hr3);
+            staging->Release();
+            goto cleanup;
+        }
+        {
+            BYTE* src = pixels;
+            BYTE* dst = (BYTE*)lr.pBits;
+            for (UINT y = 0; y < h; y++) {
+                memcpy(dst, src, stride);
+                src += stride;
+                dst += lr.Pitch;
+            }
+        }
+        staging->UnlockRect(0);
+
+        HRESULT hr4 = dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT, &g_D3D9BezelTex, nullptr);
+        if (FAILED(hr4) || !g_D3D9BezelTex) {
+            Log("[BEZEL-D3D9] FAIL step8c DEFAULT tex hr=0x%08X", hr4);
+            staging->Release();
+            goto cleanup;
+        }
+
+        HRESULT hr5 = dev->UpdateTexture(staging, g_D3D9BezelTex);
+        staging->Release();
+        if (FAILED(hr5)) {
+            Log("[BEZEL-D3D9] FAIL step8d UpdateTexture hr=0x%08X", hr5);
+            g_D3D9BezelTex->Release(); g_D3D9BezelTex = nullptr;
+            goto cleanup;
+        }
+        Log("[BEZEL-D3D9] step8 OK (staging+default) tex=%p", g_D3D9BezelTex);
+    }
+
+    wcscpy_s(g_D3D9BezelPathCached, 260, path);
+    Log("[BEZEL-D3D9] Loaded '%ls' (%ux%u) into D3D9 texture", path, w, h);
+    ok = true;
+
+cleanup:
+    if (pixels)    delete[] pixels;
+    if (converter) converter->Release();
+    if (frame)     frame->Release();
+    if (decoder)   decoder->Release();
+    if (wic)       wic->Release();
+    if (!ok)       ReleaseBezelTextureD3D9();
+    return ok;
+}
 
 // D3D9 resources initialized lazily on first EndScene
 static bool InitD3D9Resources(IDirect3DDevice9* dev) {
@@ -3061,17 +6092,34 @@ static bool InitD3D9Resources(IDirect3DDevice9* dev) {
     }
 
     // Compile pixel shader (ps_3_0 for VPOS support)
+    // MMF2 optimisation: reuse cached bytecode blob across Resets instead of
+    // recompiling from source every time (~2.5s → ~1ms per Reset).
     ID3DBlob* psBlob = nullptr;
-    ID3DBlob* errBlob = nullptr;
-    HRESULT hr = D3DCompile(D3D9_PS_SRC, strlen(D3D9_PS_SRC), "d3d9ps", nullptr, nullptr, "main", "ps_3_0", 0, 0, &psBlob, &errBlob);
-    if (FAILED(hr) || !psBlob) {
-        LogShaderError("D3D9 PS ps_3_0", errBlob);
+    if (g_IsMMF2 && g_D3D9PSCachedBlob) {
+        // Reuse previously compiled bytecode — skip D3DCompile entirely
+        psBlob = g_D3D9PSCachedBlob;
+        psBlob->AddRef();   // balance the Release() below
+        Log("[D3D9] MMF2 shader cache HIT — skipping recompilation");
+    } else {
+        ID3DBlob* errBlob = nullptr;
+        const char* d3d9PSFull = GetD3D9PSSrc();
+        HRESULT hr = D3DCompile(d3d9PSFull, strlen(d3d9PSFull), "d3d9ps", nullptr, nullptr, "main", "ps_3_0", 0, 0, &psBlob, &errBlob);
+        if (FAILED(hr) || !psBlob) {
+            LogShaderError("D3D9 PS ps_3_0", errBlob);
+            if (errBlob) errBlob->Release();
+            return false;
+        }
         if (errBlob) errBlob->Release();
-        return false;
-    }
-    if (errBlob) errBlob->Release();
 
-    hr = dev->CreatePixelShader((const DWORD*)psBlob->GetBufferPointer(), &g_D3D9PS);
+        // MMF2: store bytecode for reuse on subsequent Resets
+        if (g_IsMMF2) {
+            g_D3D9PSCachedBlob = psBlob;
+            g_D3D9PSCachedBlob->AddRef();   // keep alive beyond the Release() below
+            Log("[D3D9] MMF2 shader cache STORED — will reuse on next Reset");
+        }
+    }
+
+    HRESULT hr = dev->CreatePixelShader((const DWORD*)psBlob->GetBufferPointer(), &g_D3D9PS);
     psBlob->Release();
     if (FAILED(hr)) { Log("[D3D9] FAIL: CreatePixelShader hr=0x%08X", hr); return false; }
 
@@ -3430,13 +6478,38 @@ static void ApplyD3D9Scanlines(IDirect3DDevice9* dev) {
     constants7[1] = g_Shared->tapeNoiseIntensity;
     constants7[2] = g_Shared->vignetteEnabled;
     constants7[3] = 0.0f;
+    // c10 = (megaBezelEnabled, megaBezelThickness, megaBezelOpacity, megaBezelBlur)
+    float constants10[4];
+    constants10[0] = g_Shared->megaBezelEnabled;
+    constants10[1] = g_Shared->megaBezelThickness;
+    constants10[2] = g_Shared->megaBezelOpacity;
+    constants10[3] = g_Shared->megaBezelBlur;
+    // c11 = (megaBezelRadius, megaBezelReflectionWidth, megaBezelStartFade, _pad)
+    float constants11[4];
+    constants11[0] = g_Shared->megaBezelRadius;
+    constants11[1] = g_Shared->megaBezelReflectionWidth;
+    constants11[2] = GetMegaBezelStartFade(g_Shared->megaBezelEnabled > 0.0f);
+    constants11[3] = 0.0f;
+    // c12 = (bezelHookActive, bezelHookOpacity, _pad, _pad)
+    float constants12[4];
+    constants12[0] = g_Shared->bezelHookActive;
+    constants12[1] = g_Shared->bezelHookOpacity;
+    constants12[2] = 0.0f;
+    constants12[3] = 0.0f;
     dev->SetPixelShaderConstantF(0, constants,  4); // c0-c3
     dev->SetPixelShaderConstantF(4, constants2, 1); // c4
     dev->SetPixelShaderConstantF(5, constants3, 1); // c5 (brightness, contrast, saturation, temperature)
     dev->SetPixelShaderConstantF(6, constants4, 1); // c6 (flickerEnabled, flickerIntensity, time, flickerRate)
     dev->SetPixelShaderConstantF(7, constants5, 1); // c7 (blackLevel, gamma, phosphorEnabled, phosphorIntensity)
     dev->SetPixelShaderConstantF(8, constants6, 1); // c8 (vhsEnabled, vhsIntensity, grainIntensity, 0)
-    dev->SetPixelShaderConstantF(9, constants7, 1); // c9 (tapeNoiseEnabled, tapeNoiseIntensity, 0, 0)
+    dev->SetPixelShaderConstantF(9, constants7, 1); // c9 (tapeNoiseEnabled, tapeNoiseIntensity, vignetteEnabled, 0)
+    // c14 = (gameBoundsL, gameBoundsT, gameBoundsR, gameBoundsB) — auto-detected
+    // game content area in UV space, used by reflection to skip in-game letterbox.
+    float constants14[4] = { g_GameBoundsL, g_GameBoundsT, g_GameBoundsR, g_GameBoundsB };
+    dev->SetPixelShaderConstantF(10, constants10, 1); // c10 megaBezel core
+    dev->SetPixelShaderConstantF(11, constants11, 1); // c11 megaBezel extra
+    dev->SetPixelShaderConstantF(12, constants12, 1); // c12 bezel-PNG composite
+    dev->SetPixelShaderConstantF(14, constants14, 1); // c14 game content bounds
 
     // Copy render target when blur, bloom, curvature or brightness/contrast is active
     bool d3d9BlurOn   = g_Shared->blurEnabled      > 0.0f && g_Shared->blurIntensity      > 0.0f;
@@ -3449,7 +6522,37 @@ static void ApplyD3D9Scanlines(IDirect3DDevice9* dev) {
     bool d3d9VhsOn        = g_Shared->vhsEnabled        > 0.0f;
     bool d3d9GrainOn      = g_Shared->grainIntensity    > 0.0f;
     bool d3d9TapeNoiseOn  = g_Shared->tapeNoiseEnabled  > 0.0f && g_Shared->tapeNoiseIntensity > 0.0f;
-    bool d3d9NeedCopy = d3d9BlurOn || d3d9BloomOn || d3d9CurvOn || d3d9BcOn || d3d9FlickOn || d3d9PhosphorOn || d3d9VhsOn || d3d9GrainOn || d3d9TapeNoiseOn;
+    bool d3d9MegaBzOn     = g_Shared->megaBezelEnabled  > 0.0f;
+    bool d3d9BezelHookOn  = g_Shared->bezelHookActive   > 0.0f;
+    // Auto-detect game content bounds when reflection OR VHS/grain/tapeNoise is
+    // active — used both by the MegaBezel reflection sampler (cb14) and by the
+    // VHS content mask to exclude letterbox bars. ~50µs per call (64x36 readback).
+    bool needBounds = d3d9MegaBzOn || d3d9VhsOn || d3d9GrainOn || d3d9TapeNoiseOn;
+    if (needBounds) {
+        if ((g_DetectFrame++ % 30) == 0) DetectGameBoundsD3D9(dev);
+    } else {
+        // No effect needs bounds → reset to full-screen so reflection is neutral.
+        g_GameBoundsL = 0.0f; g_GameBoundsT = 0.0f;
+        g_GameBoundsR = 1.0f; g_GameBoundsB = 1.0f;
+        g_DetectFrame = 0;
+    }
+    {
+        static bool s_bezelWasOn = false;
+        static int  s_bezelPollCount = 0;
+        if (d3d9BezelHookOn != s_bezelWasOn) {
+            Log("[D3D9] bezelHookActive CHANGED: raw=%.2f on=%d path[0]=%d megaBz=%.2f",
+                g_Shared->bezelHookActive, d3d9BezelHookOn ? 1 : 0,
+                (int)g_Shared->bezelHookPath[0], g_Shared->megaBezelEnabled);
+            s_bezelWasOn = d3d9BezelHookOn;
+        }
+        if (++s_bezelPollCount == 600) {
+            Log("[D3D9] bezel poll: active=%.2f megaBz=%.2f path[0]=%d",
+                g_Shared->bezelHookActive, g_Shared->megaBezelEnabled,
+                (int)g_Shared->bezelHookPath[0]);
+            s_bezelPollCount = 0;
+        }
+    }
+    bool d3d9NeedCopy = d3d9BlurOn || d3d9BloomOn || d3d9CurvOn || d3d9BcOn || d3d9FlickOn || d3d9PhosphorOn || d3d9VhsOn || d3d9GrainOn || d3d9TapeNoiseOn || d3d9MegaBzOn || d3d9BezelHookOn;
 
     // Redirect drawing to the actual backbuffer — this is where Present will swap from.
     // The game may have had a custom RT bound, or an intermediate surface; we need to
@@ -3508,6 +6611,35 @@ static void ApplyD3D9Scanlines(IDirect3DDevice9* dev) {
         dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     } else {
         dev->SetTexture(0, nullptr);
+    }
+
+    // Bezel PNG texture (sampler s1). Reload from disk when the shared-mem path
+    // changes — drop cached texture when the bezel is turned off.
+    // Also retry if texture is null but path is non-empty (race: C# writes
+    // bezelHookActive before bezelHookPath, so first frame may see empty path).
+    if (d3d9BezelHookOn) {
+        bool pathChanged = wcscmp(g_Shared->bezelHookPath, g_D3D9BezelPathCached) != 0;
+        if (pathChanged || (!g_D3D9BezelTex && g_Shared->bezelHookPath[0])) {
+            Log("[D3D9] BEZEL LOAD TRIGGER: pathChanged=%d tex=%p path[0]=%d cached[0]=%d",
+                pathChanged?1:0, g_D3D9BezelTex, (int)g_Shared->bezelHookPath[0], (int)g_D3D9BezelPathCached[0]);
+            LoadBezelTextureD3D9(dev, g_Shared->bezelHookPath);
+        }
+        if (g_D3D9BezelTex) {
+            dev->SetTexture(1, g_D3D9BezelTex);
+            dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(1, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+            dev->SetSamplerState(1, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+        } else {
+            dev->SetTexture(1, nullptr);
+        }
+    } else {
+        if (g_D3D9BezelTex) ReleaseBezelTextureD3D9();
+        dev->SetTexture(1, nullptr);
+    }
+    if (d3d9BezelHookOn && !g_D3D9BezelTex) {
+        float fixup[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        dev->SetPixelShaderConstantF(12, fixup, 1);
     }
 
     // Draw fullscreen quad with UVs for texture sampling
@@ -3591,6 +6723,42 @@ static void D3D9PresentCore(IDirect3DDevice9* dev, const char* source) {
         D3D9CheckProcessBlocked();
         if (!g_D3D9Inited) InitD3D9Resources(dev);
         if (g_D3D9Inited && !g_D3D9ProcBlocked) {
+            // ── Startup blackout (megabezel only) — D3D9 path ──
+            // Mirror the D3D11 1.5s blackout: clear the backbuffer to black
+            // and skip the effect pass for the first ~1.5s after megabezel
+            // first turns on. Hides the game's launch splash / clear color
+            // (vivid blue, skybox, etc.) which would otherwise be reflected
+            // into the bezel zone AND shine through inside the game viewport.
+            // After blackout ends, the megaBezelStartFade uniform smoothly
+            // ramps the reflection up over its own 1.5s window.
+            bool d3d9PresentMegaBzOn = g_Shared && g_Shared->active &&
+                                       g_Shared->megaBezelEnabled > 0.0f;
+            if (d3d9PresentMegaBzOn) {
+                static float blackoutStartD3D9 = -1.0f;
+                const float D3D9_BLACKOUT_SECONDS = 1.5f;
+                if (blackoutStartD3D9 < 0.0f) blackoutStartD3D9 = GetTimeSeconds();
+                if ((GetTimeSeconds() - blackoutStartD3D9) < D3D9_BLACKOUT_SECONDS) {
+                    IDirect3DSurface9* bbSurf = nullptr;
+                    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbSurf)) && bbSurf) {
+                        D3DSURFACE_DESC bbDesc;
+                        if (SUCCEEDED(bbSurf->GetDesc(&bbDesc)) &&
+                            bbDesc.Width >= 64 && bbDesc.Height >= 64) {
+                            IDirect3DSurface9* prevRT = nullptr;
+                            dev->GetRenderTarget(0, &prevRT);
+                            dev->SetRenderTarget(0, bbSurf);
+                            dev->Clear(0, nullptr, D3DCLEAR_TARGET,
+                                D3DCOLOR_ARGB(255, 0, 0, 0), 1.0f, 0);
+                            if (prevRT) {
+                                dev->SetRenderTarget(0, prevRT);
+                                prevRT->Release();
+                            }
+                        }
+                        bbSurf->Release();
+                    }
+                    return;  // skip capture + ApplyScanlines this frame
+                }
+            }
+
             g_D3D9FrameCount++;
             if (g_D3D9FrameCount == 10 || g_D3D9FrameCount == 60 ||
                 g_D3D9FrameCount == 300 || g_D3D9FrameCount == 600) {
@@ -3706,6 +6874,15 @@ static HRESULT STDMETHODCALLTYPE HookedD3D9Reset(IDirect3DDevice9* dev, D3DPRESE
     g_D3D9FrameCount = 0;
     if (g_D3D9PS) { g_D3D9PS->Release(); g_D3D9PS = nullptr; }
     if (g_D3D9VS) { g_D3D9VS->Release(); g_D3D9VS = nullptr; }
+    // Bezel + auto-detect surfaces are in DEFAULT pool — MUST release before Reset
+    // or Reset returns D3DERR_INVALIDCALL (the device "is still in use"). Sets
+    // g_GameBoundsLTRB back to defaults so reflection works correctly post-Reset.
+    ReleaseBezelTextureD3D9();
+    if (g_D3D9DetectRT)  { g_D3D9DetectRT->Release();  g_D3D9DetectRT  = nullptr; }
+    if (g_D3D9DetectSys) { g_D3D9DetectSys->Release(); g_D3D9DetectSys = nullptr; }
+    g_GameBoundsL = 0.0f; g_GameBoundsT = 0.0f;
+    g_GameBoundsR = 1.0f; g_GameBoundsB = 1.0f;
+    g_DetectFrame = 0;
     g_D3D9Inited = false;
 
     DWORD oldProt;
@@ -3730,11 +6907,43 @@ static HRESULT STDMETHODCALLTYPE HookedD3D9Reset(IDirect3DDevice9* dev, D3DPRESE
     return hr;
 }
 
+// ── D3D9 resource release helper (MAME device-lifecycle) ─────────────────
+// MAME destroys its D3D9 device when launching a ROM from the menu, then calls
+// IDirect3D9::CreateDevice again for the new fullscreen exclusive device.
+// If our PS / VS / BBCopy still hold COM refs on the old device the adapter is
+// "in use" and the new CreateDevice returns D3DERR_INVALIDCALL (0x8876086C).
+// This helper releases exactly the resources that hold those refs — mirroring
+// HookedD3D9Reset — and clears g_D3D9Inited so InitD3D9Resources re-runs on
+// the next EndScene/Present call with the brand-new device.
+// NOTE: g_D3D9Device is cleared but NOT Release()d here because by the time
+// MAME calls CreateDevice again the old device COM object may already be dead;
+// attempting Release() on a zombie device can crash.
+static void D3D9ReleaseOurResources() {
+    if (g_D3D9BBCopy) { g_D3D9BBCopy->Release(); g_D3D9BBCopy = nullptr; }
+    g_D3D9LastW = 0; g_D3D9LastH = 0;
+    g_D3D9HasCapture = false;
+    g_D3D9FrameCount = 0;
+    if (g_D3D9PS) { g_D3D9PS->Release(); g_D3D9PS = nullptr; }
+    if (g_D3D9VS) { g_D3D9VS->Release(); g_D3D9VS = nullptr; }
+    // Bezel PNG texture is in D3DPOOL_DEFAULT (D3D9Ex doesn't allow MANAGED) so
+    // it MUST be released before Reset, or Reset fails. Same for device-recreation.
+    ReleaseBezelTextureD3D9();
+    // Auto-detect surfaces (DEFAULT + SYSTEMMEM) — also lost on Reset.
+    if (g_D3D9DetectRT)  { g_D3D9DetectRT->Release();  g_D3D9DetectRT  = nullptr; }
+    if (g_D3D9DetectSys) { g_D3D9DetectSys->Release(); g_D3D9DetectSys = nullptr; }
+    g_GameBoundsL = 0.0f; g_GameBoundsT = 0.0f;
+    g_GameBoundsR = 1.0f; g_GameBoundsB = 1.0f;
+    g_DetectFrame = 0;
+    g_D3D9Device = nullptr; // cleared without Release — old device may be a zombie
+    g_D3D9Inited = false;
+    Log("[MAME] D3D9ReleaseOurResources: PS/VS/BBCopy/Bezel released, device cleared");
+}
+
 // ── Deferred D3D9 device-hook installer ──────────────────────────────────
 // Fires when the GAME calls IDirect3D9::CreateDevice (vtable slot 16).
-// Used as a fallback when our own dummy CreateDevice fails at injection time.
-// This is a one-shot hook: original bytes are restored before the real call
-// and are NOT re-patched afterwards.
+// Non-MAME: one-shot hook — original bytes restored before call, NOT re-patched.
+// MAME: permanent restore-call-repatch — releases our D3D9 resources first so
+//       the new exclusive-fullscreen device can be created without INVALIDCALL.
 typedef HRESULT(STDMETHODCALLTYPE* PFN_D3D9CDev)(
     IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
     D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
@@ -3744,7 +6953,34 @@ static HRESULT STDMETHODCALLTYPE HookedD3D9CreateDevice(
     HWND hFocusWindow, DWORD BehaviorFlags,
     D3DPRESENT_PARAMETERS* pPP, IDirect3DDevice9** ppDevice)
 {
-    // Restore original bytes — one-shot, do NOT re-patch afterwards.
+    if (g_IsMame) {
+        // ── MAME path: permanent restore-call-repatch ─────────────────────
+        // MAME calls CreateDevice again each time a ROM is launched. Release
+        // our COM resources first so the adapter isn't "in use", then let the
+        // real call proceed, then re-patch so we intercept the NEXT launch too.
+        Log("[MAME] HookedD3D9CreateDevice — releasing cached resources for device recreation");
+        D3D9ReleaseOurResources();
+
+        DWORD op;
+        VirtualProtect(g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_D3D9CreateDeviceAddr, g_D3D9CreateDeviceOrig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE, op, &op);
+
+        HRESULT hr = ((PFN_D3D9CDev)g_D3D9CreateDeviceAddr)(
+            pThis, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppDevice);
+
+        // Re-patch — keep hook active for subsequent ROM launches.
+        VirtualProtect(g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_D3D9CreateDeviceAddr, g_D3D9CreateDeviceJmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE, op, &op);
+
+        Log("[MAME] CreateDevice hr=0x%08X — resources will reinit at next EndScene/Present", (unsigned)hr);
+        return hr;
+    }
+
+    // ── Non-MAME path: one-shot deferred fallback (original v1.2 behavior) ─
     DWORD op;
     VirtualProtect(g_D3D9CreateDeviceAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
     memcpy(g_D3D9CreateDeviceAddr, g_D3D9CreateDeviceOrig, HOOK_JMP_SIZE);
@@ -3797,6 +7033,30 @@ static HRESULT STDMETHODCALLTYPE HookedD3D9CreateDeviceEx(
     D3DPRESENT_PARAMETERS* pPP, D3DDISPLAYMODEEX* pMode,
     IDirect3DDevice9Ex** ppDevice)
 {
+    if (g_IsMame) {
+        // ── MAME path: permanent restore-call-repatch ─────────────────────
+        Log("[MAME] HookedD3D9CreateDeviceEx — releasing cached resources for device recreation");
+        D3D9ReleaseOurResources();
+
+        DWORD op;
+        VirtualProtect(g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_D3D9CreateDeviceExAddr, g_D3D9CreateDeviceExOrig, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE, op, &op);
+
+        HRESULT hr = ((PFN_D3D9CDevEx)g_D3D9CreateDeviceExAddr)(
+            pThis, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, pMode, ppDevice);
+
+        VirtualProtect(g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
+        memcpy(g_D3D9CreateDeviceExAddr, g_D3D9CreateDeviceExJmp, HOOK_JMP_SIZE);
+        FlushInstructionCache(GetCurrentProcess(), g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE);
+        VirtualProtect(g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE, op, &op);
+
+        Log("[MAME] CreateDeviceEx hr=0x%08X — resources will reinit at next EndScene/Present", (unsigned)hr);
+        return hr;
+    }
+
+    // ── Non-MAME path: one-shot deferred fallback ────────────────────────
     DWORD op;
     VirtualProtect(g_D3D9CreateDeviceExAddr, HOOK_JMP_SIZE, PAGE_EXECUTE_READWRITE, &op);
     memcpy(g_D3D9CreateDeviceExAddr, g_D3D9CreateDeviceExOrig, HOOK_JMP_SIZE);
@@ -4015,6 +7275,39 @@ static bool InstallD3D9Hook() {
                 dummyDevEx->Release();
             }
             d3d9ex->Release();
+        }
+    }
+
+    // ── MAME: install permanent CreateDevice/CreateDeviceEx hooks ───────────
+    // When the dummy device succeeded (NULLREF path — typical for MAME), the
+    // deferred fallback path never fires, so g_D3D9CreateDeviceAddr is still
+    // null. We install the permanent hooks HERE, before releasing d3d9, while
+    // the factory vtable pointer is still valid.
+    // For non-MAME processes this block is a complete no-op.
+    if (g_IsMame) {
+        void** vtbl9mame = *(void***)d3d9;
+        g_D3D9CreateDeviceAddr = (BYTE*)vtbl9mame[16];
+        if (InstallHookAt(g_D3D9CreateDeviceAddr, g_D3D9CreateDeviceOrig,
+                          g_D3D9CreateDeviceJmp, (void*)HookedD3D9CreateDevice))
+            Log("[MAME] Permanent hook: IDirect3D9::CreateDevice at 0x%p",
+                (void*)g_D3D9CreateDeviceAddr);
+        else
+            Log("[MAME] WARN: failed to install permanent CreateDevice hook");
+
+        // Also hook IDirect3D9Ex::CreateDeviceEx (slot 20) — MAME may use the Ex path.
+        if (pCreate9Ex) {
+            IDirect3D9Ex* probeEx = nullptr;
+            if (SUCCEEDED(pCreate9Ex(D3D_SDK_VERSION, &probeEx)) && probeEx) {
+                void** vtbl9ex = *(void***)probeEx;
+                g_D3D9CreateDeviceExAddr = (BYTE*)vtbl9ex[20];
+                probeEx->Release();
+                if (InstallHookAt(g_D3D9CreateDeviceExAddr, g_D3D9CreateDeviceExOrig,
+                                  g_D3D9CreateDeviceExJmp, (void*)HookedD3D9CreateDeviceEx))
+                    Log("[MAME] Permanent hook: IDirect3D9Ex::CreateDeviceEx at 0x%p",
+                        (void*)g_D3D9CreateDeviceExAddr);
+                else
+                    Log("[MAME] WARN: failed to install permanent CreateDeviceEx hook");
+            }
         }
     }
 
@@ -5424,6 +8717,10 @@ static bool SafeInstallD3D11Hook() {
     __try { return InstallD3D11Hook(); }
     __except(EXCEPTION_EXECUTE_HANDLER) { Log("[D3D11] InstallD3D11Hook: EXCEPTION 0x%08X caught", GetExceptionCode()); return false; }
 }
+static bool SafeInstallD3D12QueueHook() {
+    __try { return InstallD3D12QueueHook(); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { Log("[D3D12] InstallD3D12QueueHook: EXCEPTION 0x%08X caught", GetExceptionCode()); return false; }
+}
 static bool SafeInstallD3D9Hook() {
     __try { return InstallD3D9Hook(); }
     __except(EXCEPTION_EXECUTE_HANDLER) { Log("[D3D9] InstallD3D9Hook: EXCEPTION 0x%08X caught", GetExceptionCode()); return false; }
@@ -5433,9 +8730,21 @@ static bool SafeInstallOpenGLHook() {
     __except(EXCEPTION_EXECUTE_HANDLER) { Log("[GL] InstallOpenGLHook: EXCEPTION 0x%08X caught", GetExceptionCode()); return false; }
 }
 
+// ── Forward declaration for parallel Gopher hook path ───────────────────
+static DWORD GopherHookThread();
+
 // ── Worker thread ────────────────────────────────────────────────────────
 static DWORD WINAPI HookThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    // ── Gopher64 parallel path ──
+    // When g_IsGopher is TRUE, branch to a completely isolated code path that
+    // never touches the main D3D11/D3D9/OpenGL/DDraw/GDI hooks below. When
+    // FALSE, the rest of this function is byte-for-byte identical to v1.2.
+    if (g_IsGopher) {
+        Log("[GOPHER] HookThread: diverging to GopherHookThread (parallel path)");
+        return GopherHookThread();
+    }
 
     // EARLY DDraw install (before the 2s wait) — needed for games like Fusion
     // that create their HAL surfaces very early at process startup. If ddraw.dll
@@ -5479,6 +8788,13 @@ static DWORD WINAPI HookThread(LPVOID) {
         }
     }
 
+    // Deferred MMF2 detection — mmfs2.dll may not be loaded yet at DLL_PROCESS_ATTACH
+    // (MMF2 loads its runtime DLLs a few seconds after startup).
+    if (!g_IsMMF2 && (GetModuleHandleW(L"mmfs2.dll") || GetModuleHandleW(L"mmf2d3d9.dll"))) {
+        g_IsMMF2 = true;
+        Log("[MMF2] Clickteam MMF2 runtime detected (deferred) — enabling shader bytecode cache");
+    }
+
     // Try all hooks — only for APIs already loaded by the game
     bool d3d11ok = SafeInstallD3D11Hook();
     bool d3d9ok  = SafeInstallD3D9Hook();
@@ -5489,10 +8805,16 @@ static DWORD WINAPI HookThread(LPVOID) {
     // interference with D3D11/D3D9/OpenGL games.  Catches pure-GDI games
     // (Clickteam Fusion software mode, Direct2D HWND render targets, etc.).
     bool gdiOk  = SafeInstallGDIHook();
+    // D3D12 command-queue capture — only when the game actually uses D3D12.
+    // Independent of the D3D11 hook: the shared DXGI Present hook (installed by
+    // SafeInstallD3D11Hook) catches the frame; this just grabs the queue so we
+    // can graft a D3D11On12 device. Returns false (harmless) for non-D3D12 games.
+    bool d3d12ok = SafeInstallD3D12QueueHook();
 
-    Log("[THREAD] Hook results: D3D11=%s D3D9=%s OpenGL=%s DDraw=%s GDI=%s",
+    Log("[THREAD] Hook results: D3D11=%s D3D9=%s OpenGL=%s DDraw=%s GDI=%s D3D12=%s",
         d3d11ok ? "OK" : "fail", d3d9ok ? "OK" : "fail",
-        glOk ? "OK" : "fail", ddrawOk ? "OK" : "fail", gdiOk ? "OK" : "fail");
+        glOk ? "OK" : "fail", ddrawOk ? "OK" : "fail", gdiOk ? "OK" : "fail",
+        d3d12ok ? "OK" : "n/a");
 
     // Second module snapshot at T+8s — catches DLLs loaded after game fully inits
     Sleep(6000);
@@ -5528,6 +8850,8 @@ static DWORD WINAPI HookThread(LPVOID) {
             if (!ddrawOk) ddrawOk = SafeInstallDDrawHook();
             // Retry GDI hook if it failed on first attempt
             if (!gdiOk) gdiOk = SafeInstallGDIHook();
+            // Retry D3D12 queue capture — d3d12.dll may load a few seconds late
+            if (!d3d12ok) d3d12ok = SafeInstallD3D12QueueHook();
             // Log whenever a new hook gets installed
             if ((!prevD3D11 && d3d11ok) || (!prevD3D9 && d3d9ok) ||
                 (!prevGL && glOk) || (!prevDD && ddrawOk))
@@ -5568,6 +8892,7 @@ static void Cleanup() {
         VirtualProtect(g_MakeCurrentAddr, HOOK_JMP_SIZE, op, &op);
         g_MakeCurrentAddr = nullptr;
     }
+    if (g_D3D9PSCachedBlob) { g_D3D9PSCachedBlob->Release(); g_D3D9PSCachedBlob = nullptr; }
     if (g_Shared) { UnmapViewOfFile(g_Shared); g_Shared = nullptr; }
     if (g_MapFile) { CloseHandle(g_MapFile); g_MapFile = nullptr; }
     if (g_Raster) { g_Raster->Release(); g_Raster = nullptr; }
@@ -5577,6 +8902,27 @@ static void Cleanup() {
     if (g_VS) { g_VS->Release(); g_VS = nullptr; }
     if (g_Ctx) { g_Ctx->Release(); g_Ctx = nullptr; }
     if (g_Device) { g_Device->Release(); g_Device = nullptr; }
+    // ── D3D12 / D3D11On12 parallel-path resources ──
+    ReleaseBezelTexture12();
+    if (g_D2DCtx12)    { g_D2DCtx12->Release();    g_D2DCtx12 = nullptr; }
+    if (g_D2DDevice12) { g_D2DDevice12->Release(); g_D2DDevice12 = nullptr; }
+    if (g_D2DFactory12){ g_D2DFactory12->Release();g_D2DFactory12 = nullptr; }
+    if (g_BBSRV12)     { g_BBSRV12->Release();     g_BBSRV12 = nullptr; }
+    if (g_BBCopy12)    { g_BBCopy12->Release();    g_BBCopy12 = nullptr; }
+    if (g_Raster12)    { g_Raster12->Release();    g_Raster12 = nullptr; }
+    if (g_BezelSamp12) { g_BezelSamp12->Release(); g_BezelSamp12 = nullptr; }
+    if (g_Sampler12)   { g_Sampler12->Release();   g_Sampler12 = nullptr; }
+    if (g_BlendOver12) { g_BlendOver12->Release(); g_BlendOver12 = nullptr; }
+    if (g_Blend12)     { g_Blend12->Release();     g_Blend12 = nullptr; }
+    if (g_CB12)        { g_CB12->Release();        g_CB12 = nullptr; }
+    if (g_PS12)        { g_PS12->Release();        g_PS12 = nullptr; }
+    if (g_VS12)        { g_VS12->Release();        g_VS12 = nullptr; }
+    if (g_SC3)         { g_SC3->Release();         g_SC3 = nullptr; }
+    if (g_Ctx11on12)   { g_Ctx11on12->Release();   g_Ctx11on12 = nullptr; }
+    if (g_On12)        { g_On12->Release();        g_On12 = nullptr; }
+    if (g_Dev11on12)   { g_Dev11on12->Release();   g_Dev11on12 = nullptr; }
+    if (g_GameCmdQueue){ g_GameCmdQueue->Release();g_GameCmdQueue = nullptr; }
+    if (g_D3D12Device) { g_D3D12Device->Release(); g_D3D12Device = nullptr; }
 }
 
 // ── DLL Entry Point ──────────────────────────────────────────────────────
@@ -5586,6 +8932,37 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_Module = hModule;
         DisableThreadLibraryCalls(hModule);
         LogInit();
+        // ── Gopher64 detection (sets g_IsGopher BEFORE HookThread starts) ──
+        // When the host exe name matches a Gopher64 binary, HookThread takes
+        // a completely different parallel code path — none of the main
+        // D3D11/D3D9/OpenGL/DDraw/GDI hooks are installed. This guarantees
+        // byte-for-byte v1.2 behavior for every other game/emulator.
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            if (n > 0) {
+                const wchar_t* exeName = wcsrchr(exePath, L'\\');
+                exeName = exeName ? (exeName + 1) : exePath;
+                if (_wcsicmp(exeName, L"gopher64-windows-x86_64.exe") == 0 ||
+                    _wcsicmp(exeName, L"gopher64.exe") == 0) {
+                    g_IsGopher = true;
+                    Log("[GOPHER] Host exe detected as Gopher64 (%ls) — enabling parallel hook path", exeName);
+                }
+                // MAME detection: matches mame.exe, mame64.exe, mame0270.exe, etc.
+                // _wcsnicmp checks only the first 4 chars so any MAME versioned binary matches.
+                if (_wcsnicmp(exeName, L"mame", 4) == 0) {
+                    g_IsMame = true;
+                    Log("[MAME] Host exe detected as MAME (%ls) — enabling device-lifecycle hook", exeName);
+                }
+            }
+        }
+        // MMF2 (Clickteam) detection — check for runtime DLL in process modules.
+        // MMF2 games call Reset multiple times per level transition; when detected
+        // we cache the compiled shader bytecode so Reset takes ~1ms instead of ~2.5s.
+        if (GetModuleHandleW(L"mmfs2.dll") || GetModuleHandleW(L"mmf2d3d9.dll")) {
+            g_IsMMF2 = true;
+            Log("[MMF2] Clickteam MMF2 runtime detected — enabling shader bytecode cache");
+        }
         CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr);
         break;
     case DLL_PROCESS_DETACH:

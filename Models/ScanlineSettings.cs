@@ -7,6 +7,14 @@ public class ScanlineSettings
     public double BezelOpacity { get; set; } = 0;
     public bool BezelEnabled { get; set; } = false;
 
+    // MegaBezel reflection (mirror reflection of game edges into border zone)
+    public bool MegaBezelEnabled { get; set; } = false;
+    public double MegaBezelThickness { get; set; } = 44;
+    public double MegaBezelOpacity { get; set; } = 54;
+    public double MegaBezelBlur { get; set; } = 95;
+    public double MegaBezelRadius { get; set; } = 0;    // REFL. RADIUS — rounds reflection inner corner (0 = square corners, origin)
+    public double MegaBezelReflectionWidth { get; set; } = 71;
+
     // Horizontal scanlines
     public bool HorizontalEnabled { get; set; } = true;
     public int HGap { get; set; } = 3;
@@ -28,8 +36,8 @@ public class ScanlineSettings
     public bool BloomEnabled { get; set; } = false;
     public double BloomIntensity { get; set; } = 0;
     public bool CurvatureEnabled { get; set; } = false;
-    public double CurvatureIntensity { get; set; } = 0;
-    public bool VignetteEnabled { get; set; } = false;
+    public double CurvatureIntensity { get; set; } = 12;
+    public double GameCornerRadius { get; set; } = 0;   // rounds the game corners + black fill (0 = off). Replaces the old EDGE FADE toggle.
     public bool FlickerEnabled { get; set; } = false;
     public double FlickerIntensity { get; set; } = 0;
     public double FlickerRate { get; set; } = 25;

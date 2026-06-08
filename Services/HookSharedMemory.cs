@@ -16,11 +16,26 @@ public sealed class HookSharedMemory : IDisposable
     private bool _disposed;
 
     private const string MAP_NAME = "S4W_ScanlineSettings";
-    // 164 (header+ScanlineCB+VHS+TapeNoise) + 4 (osdActive) + 256 (osdText: 128 wchar_t) = 424 → round up to 512
-    private const int TOTAL_SIZE = 512;
-    private const int OSD_OFFSET        = 164;  // byte offset of OSD block
-    private const int OSD_TEXT_MAX_CHARS = 128; // wchar_t count
-    private const int BORDERLESS_OFFSET = 424;  // byte offset of borderlessEnabled (int)
+    // Header+CB (164) + OSD (4 + 256) + Borderless (4) + MegaBezel (16)
+    //   + BezelHook block (8 floats hdr + 520 wchar_t path) = 972 → round up to 1024
+    private const int TOTAL_SIZE = 1024;
+    private const int OSD_OFFSET        = 164;
+    private const int OSD_TEXT_MAX_CHARS = 128;
+    private const int BORDERLESS_OFFSET = 424;
+    private const int MEGABEZEL_OFFSET           = 428;
+    private const int MEGABEZEL_THICKNESS_OFFSET = 432;
+    private const int MEGABEZEL_OPACITY_OFFSET   = 436;
+    private const int MEGABEZEL_BLUR_OFFSET      = 440;
+    private const int MEGABEZEL_RADIUS_OFFSET    = 444;
+    // Bezel-render-in-hook block (offset 448):
+    //   bezelHookActive (float, 448), bezelHookOpacity (float, 452),
+    //   bezelHookPath (260 wchar_t = 520 bytes, 456..975)
+    private const int BEZEL_HOOK_ACTIVE_OFFSET  = 448;
+    private const int BEZEL_HOOK_OPACITY_OFFSET = 452;
+    private const int BEZEL_HOOK_PATH_OFFSET    = 456;
+    private const int BEZEL_HOOK_PATH_MAX_CHARS = 260;
+    // Reflection width sits after the bezel path (456 + 520 = 976).
+    private const int MEGABEZEL_REFLECTION_WIDTH_OFFSET = 976;
 
     // ── Shared memory layout (must match C++ SharedMem struct) ──
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -76,7 +91,7 @@ public sealed class HookSharedMemory : IDisposable
         public float GrainIntensity;       // 0.0 to 1.0 (0 = grain off)
         public float TapeNoiseEnabled;     // 1.0 = on, 0.0 = off
         public float TapeNoiseIntensity;   // 0.0 to 1.0
-        public float VignetteEnabled;      // 1.0 = edge vignette on, 0.0 = off
+        public float VignetteEnabled;      // REPURPOSED: game corner radius 0.0–1.0 (0 = off). Field/offset kept for layout stability.
     }
 
     /// <summary>
@@ -147,7 +162,7 @@ public sealed class HookSharedMemory : IDisposable
             GrainIntensity     = (s.GrainEnabled && s.GrainIntensity > 0) ? (float)(s.GrainIntensity / 100.0) : 0.0f,
             TapeNoiseEnabled   = (s.TapeNoiseEnabled && s.TapeNoiseIntensity > 0) ? 1.0f : 0.0f,
             TapeNoiseIntensity = (float)(s.TapeNoiseIntensity / 100.0),
-            VignetteEnabled    = s.VignetteEnabled ? 1.0f : 0.0f,
+            VignetteEnabled    = (float)(s.GameCornerRadius / 100.0),   // game corner radius (0–1)
             Brightness  = s.LumaEnabled ? (float)(s.BrightnessValue  / 100.0) : 0f,
             Contrast    = s.LumaEnabled ? (float)(s.ContrastValue    / 100.0) : 0f,
             Saturation  = s.LumaEnabled ? (float)(s.SaturationValue  / 100.0) : 0f,
@@ -160,6 +175,31 @@ public sealed class HookSharedMemory : IDisposable
 
         // Write borderless request flag at fixed offset (outside the main struct)
         _accessor.Write(BORDERLESS_OFFSET, s.BorderlessEnabled ? 1 : 0);
+
+        // Write MegaBezel reflection block at fixed offsets (4 floats).
+        // Independent of bezel-art toggle — only writes shader uniforms.
+        _accessor.Write(MEGABEZEL_OFFSET,           s.MegaBezelEnabled ? 1.0f : 0.0f);
+        _accessor.Write(MEGABEZEL_THICKNESS_OFFSET, (float)(s.MegaBezelThickness / 100.0));
+        _accessor.Write(MEGABEZEL_OPACITY_OFFSET,   (float)(s.MegaBezelOpacity   / 100.0));
+        _accessor.Write(MEGABEZEL_BLUR_OFFSET,      (float)(s.MegaBezelBlur      / 100.0));
+        _accessor.Write(MEGABEZEL_RADIUS_OFFSET,    (float)(s.MegaBezelRadius    / 100.0));
+        _accessor.Write(MEGABEZEL_REFLECTION_WIDTH_OFFSET,
+                        (float)(s.MegaBezelReflectionWidth / 100.0));
+
+        // Bezel-render-in-hook: only when MegaBezel + bezel image are both on,
+        // the hook composites the PNG itself so the reflection is ON TOP of it.
+        // Otherwise the WPF overlay renders the bezel as before.
+        bool useHookBezel = s.MegaBezelEnabled && s.BezelEnabled
+                            && !string.IsNullOrEmpty(s.BezelPath);
+        _accessor.Write(BEZEL_HOOK_OPACITY_OFFSET, (float)(s.BezelOpacity / 100.0));
+        // Write path BEFORE active flag so the hook never sees active=1 with an empty path.
+        string p = useHookBezel ? s.BezelPath : "";
+        if (p.Length > BEZEL_HOOK_PATH_MAX_CHARS - 1)
+            p = p[..(BEZEL_HOOK_PATH_MAX_CHARS - 1)];
+        byte[] pathBytes = System.Text.Encoding.Unicode.GetBytes(p + '\0');
+        _accessor.WriteArray(BEZEL_HOOK_PATH_OFFSET, pathBytes, 0,
+                             Math.Min(pathBytes.Length, BEZEL_HOOK_PATH_MAX_CHARS * 2));
+        _accessor.Write(BEZEL_HOOK_ACTIVE_OFFSET,  useHookBezel ? 1.0f : 0.0f);
     }
 
     /// <summary>

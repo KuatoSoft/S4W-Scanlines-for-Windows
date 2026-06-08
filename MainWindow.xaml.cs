@@ -658,7 +658,43 @@ public partial class MainWindow : Window
     private void Window_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
         if (e.OriginalSource is DependencyObject src && NeedsKeyboardFocus(src))
-            Activate();
+            ActivateForInput();
+    }
+
+    // Reliable activation for text input on a WS_EX_NOACTIVATE window.
+    // A plain Activate() (→ SetForegroundWindow) is silently blocked by Windows'
+    // foreground-lock / UIPI rules in some sessions, which is exactly why a few
+    // users could only type in the profile field when launching as admin. By
+    // briefly attaching our input queue to the current foreground thread, the
+    // activation always succeeds — WITHOUT requiring elevation.
+    //
+    // Scope & safety: this runs ONLY when a text control (profile combo / text
+    // box) is clicked — never for sliders, toggles or buttons, so the normal
+    // no-focus-steal behaviour for in-game tweaking is completely unchanged.
+    private void ActivateForInput()
+    {
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) { Activate(); return; }
+
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        uint myThread = NativeMethods.GetCurrentThreadId();
+        uint fgThread = (foreground != IntPtr.Zero)
+            ? NativeMethods.GetWindowThreadProcessId(foreground, out _)
+            : 0;
+
+        // Nothing to do if we are already the foreground thread.
+        bool attached = fgThread != 0 && fgThread != myThread
+                        && NativeMethods.AttachThreadInput(myThread, fgThread, true);
+        try
+        {
+            NativeMethods.SetForegroundWindow(hwnd);
+            Activate();   // WPF-level activation so keyboard focus reaches the control
+        }
+        finally
+        {
+            if (attached)
+                NativeMethods.AttachThreadInput(myThread, fgThread, false);
+        }
     }
 
     private static bool NeedsKeyboardFocus(DependencyObject obj)
@@ -974,7 +1010,6 @@ protected override void OnClosed(EventArgs e)
         SliderHOpacity.ValueChanged += (_, _) => ScheduleOverlayUpdate();
         SliderVOpacity.ValueChanged += (_, _) => ScheduleOverlayUpdate();
         SliderBlur.ValueChanged += (_, _) => ScheduleOverlayUpdate();
-        SliderBezelOpacity.ValueChanged += (_, _) => ScheduleOverlayUpdate();
         TxtBezelPath.TextChanged  += (_, _) => { ScheduleOverlayUpdate(); UpdateNoneColors(); };
         CmbAppPath.SelectionChanged += (_, _) => UpdateNoneColors();
 
@@ -1183,20 +1218,14 @@ protected override void OnClosed(EventArgs e)
         SliderCurvature.IsEnabled = on;
         SliderCurvature.Style = (Style)FindResource(on ? "PinkSlider" : "GraySlider");
 
-        // Edge fade toggle is only active when curvature is on
-        ToggleVignette.IsEnabled = on;
-        LblVignetteTitle.Foreground = (on && ToggleVignette.IsChecked == true) ? white : gray;
-
         ScheduleOverlayUpdate();
     }
 
-    private void ToggleVignette_Changed(object sender, RoutedEventArgs e)
+    // GAME CORNERS slider — rounds the game corners + black fill (replaces the
+    // old EDGE FADE toggle). Independent of curvature. 0 = off.
+    private void SliderGameCorners_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         if (!_isLoaded) return;
-        bool on = ToggleVignette.IsChecked == true;
-        var white = (Brush)new BrushConverter().ConvertFrom("White")!;
-        var gray  = (Brush)new BrushConverter().ConvertFrom("#555555")!;
-        LblVignetteTitle.Foreground = on ? white : gray;
         ScheduleOverlayUpdate();
     }
 
@@ -1681,7 +1710,8 @@ protected override void OnClosed(EventArgs e)
         CrtGroupContentPanel.Opacity   = on ? 1.0 : 0.35;
         if (on)
         {
-            ToggleCurvature_Changed(ToggleCurvature, new RoutedEventArgs());
+            // Curvature is no longer a member of the CRT group — it lives in
+            // the BEZEL section now and is independent of this master toggle.
             ToggleBlur_Changed(ToggleBlur, new RoutedEventArgs());
             ToggleBloom_Changed(ToggleBloom, new RoutedEventArgs());
             ToggleFlicker_Changed(ToggleFlicker, new RoutedEventArgs());
@@ -1711,6 +1741,22 @@ protected override void OnClosed(EventArgs e)
         bool enabled = ToggleBezelEnabled.IsChecked == true;
         BezelContentPanel.IsEnabled = enabled;
         BezelContentPanel.Opacity   = enabled ? 1.0 : 0.35;
+        ScheduleOverlayUpdate();
+    }
+
+    // ── MegaBezel reflection toggle + sliders ───────────────────────────────
+    private void ToggleMegaBezel_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_isLoaded) return;
+        bool enabled = ToggleMegaBezel.IsChecked == true;
+        MegaBezelContentPanel.IsEnabled = enabled;
+        MegaBezelContentPanel.Opacity   = enabled ? 1.0 : 0.35;
+        ScheduleOverlayUpdate();
+    }
+
+    private void SliderMegaBezel_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (!_isLoaded) return;
         ScheduleOverlayUpdate();
     }
 
@@ -1841,8 +1887,16 @@ protected override void OnClosed(EventArgs e)
         return new ScanlineSettings
         {
             BezelPath         = _bezelFullPath,
-            BezelOpacity      = SliderBezelOpacity.Value,
+            // Bezel opacity slider was removed — bezel image is always full
+            // opacity when the toggle is on (the toggle now controls everything).
+            BezelOpacity      = 100.0,
             BezelEnabled      = ToggleBezelEnabled.IsChecked == true,
+            MegaBezelEnabled   = ToggleMegaBezel.IsChecked == true,
+            MegaBezelThickness = SliderMegaBezelThickness.Value,
+            MegaBezelOpacity   = SliderMegaBezelOpacity.Value,
+            MegaBezelBlur      = SliderMegaBezelBlur.Value,
+            MegaBezelRadius    = SliderMegaBezelRadius.Value,
+            MegaBezelReflectionWidth = SliderMegaBezelReflectionWidth.Value,
             HorizontalEnabled = ToggleHorizontal.IsChecked == true,
             HGap              = InputParser.ParsePixelValue(TxtHGap.Text),
             HWidth            = 0, // auto: full screen width
@@ -1858,8 +1912,10 @@ protected override void OnClosed(EventArgs e)
             BlurIntensity     = SliderBlur.Value,
             BloomEnabled      = ToggleCrtGroup.IsChecked == true && ToggleBloom.IsChecked == true,
             BloomIntensity    = SliderBloom.Value,
-            CurvatureEnabled  = ToggleCrtGroup.IsChecked == true && ToggleCurvature.IsChecked == true,
-            VignetteEnabled   = ToggleCrtGroup.IsChecked == true && ToggleCurvature.IsChecked == true && ToggleVignette.IsChecked == true,
+            // Curvature + edge fade live in the BEZEL section now — independent
+            // of the CRT-group master toggle.
+            CurvatureEnabled  = ToggleCurvature.IsChecked == true,
+            GameCornerRadius  = SliderGameCorners.Value,
             CurvatureIntensity = SliderCurvature.Value,
             FlickerEnabled    = ToggleCrtGroup.IsChecked == true && ToggleFlicker.IsChecked == true,
             FlickerIntensity  = SliderFlicker.Value,
@@ -2087,7 +2143,12 @@ protected override void OnClosed(EventArgs e)
         // Game/emulator profiles = hook DLL renders scanlines; overlay is bezel-only.
         _overlay.EnableLegacyScanlines = IsDesktopProfile();
         _overlay.PositionOnMonitor(settings.MonitorIndex);
-        string effectiveBezelPath = settings.BezelEnabled ? settings.BezelPath : "";
+        // When MegaBezel + bezel are both on, the hook DLL renders the bezel
+        // PNG itself (so the reflection appears on top of it). Hide the WPF
+        // overlay's bezel image in that case to avoid double rendering.
+        bool hookOwnsBezel = settings.MegaBezelEnabled && settings.BezelEnabled
+                             && !string.IsNullOrEmpty(settings.BezelPath);
+        string effectiveBezelPath = (settings.BezelEnabled && !hookOwnsBezel) ? settings.BezelPath : "";
         _overlay.UpdateBezel(effectiveBezelPath, settings.BezelOpacity);
         _overlay.UpdateScanlines(settings);
     }
@@ -3318,7 +3379,6 @@ private void BtnBezelReset_Click(object sender, RoutedEventArgs e)
 {
     _bezelFullPath              = "";
     TxtBezelPath.Text           = NoneText;
-    SliderBezelOpacity.Value    = 0;
     ToggleBezelEnabled.IsChecked = false;
     BezelContentPanel.IsEnabled  = false;
     BezelContentPanel.Opacity    = 0.35;
@@ -3547,10 +3607,18 @@ private void BtnBezelNext_Click(object sender, RoutedEventArgs e) => CycleBezelI
         _applyingSettings = true;
         _bezelFullPath           = s.BezelPath ?? "";
         TxtBezelPath.Text        = string.IsNullOrEmpty(s.BezelPath) ? NoneText : Path.GetFileName(s.BezelPath);
-        SliderBezelOpacity.Value = s.BezelOpacity;
         ToggleBezelEnabled.IsChecked = s.BezelEnabled;
         BezelContentPanel.IsEnabled  = s.BezelEnabled;
         BezelContentPanel.Opacity    = s.BezelEnabled ? 1.0 : 0.35;
+
+        ToggleMegaBezel.IsChecked       = s.MegaBezelEnabled;
+        SliderMegaBezelThickness.Value  = s.MegaBezelThickness;
+        SliderMegaBezelOpacity.Value    = s.MegaBezelOpacity;
+        SliderMegaBezelBlur.Value       = s.MegaBezelBlur;
+        SliderMegaBezelRadius.Value     = s.MegaBezelRadius;
+        SliderMegaBezelReflectionWidth.Value = s.MegaBezelReflectionWidth;
+        MegaBezelContentPanel.IsEnabled = s.MegaBezelEnabled;
+        MegaBezelContentPanel.Opacity   = s.MegaBezelEnabled ? 1.0 : 0.35;
 
         ToggleHorizontal.IsChecked = s.HorizontalEnabled;
         TxtHGap.Text       = InputParser.FormatPixelValue(s.HGap);
@@ -3571,7 +3639,7 @@ private void BtnBezelNext_Click(object sender, RoutedEventArgs e) => CycleBezelI
         ToggleBloom.IsChecked     = s.BloomEnabled;
         SliderBloom.Value         = s.BloomIntensity;
         ToggleCurvature.IsChecked = s.CurvatureEnabled;
-        ToggleVignette.IsChecked  = s.VignetteEnabled;
+        SliderGameCorners.Value   = s.GameCornerRadius;
         SliderCurvature.Value     = s.CurvatureIntensity;
         ToggleFlicker.IsChecked   = s.FlickerEnabled;
         SliderFlicker.Value       = s.FlickerIntensity;
@@ -4564,11 +4632,11 @@ private static string FormatHotkeyDisplay(ModifierKeys mods, Key key)
         LblTapeNoiseIntensity.Text= L("INTENSITY",                  "INTENSITÉ",                    "INTENSITÄT",                   "INTENSITÀ",                    "INTENSIDAD",                   "INTENSIDADE");
 
         // ── Tab 1: Bezel ──
-        LblBezelSectionHeader.Text = "BEZEL";
+        LblBezelSectionHeader.Text = L("BEZEL & GEOMETRY", "BEZEL & GÉOMÉTRIE", "BEZEL & GEOMETRIE", "BEZEL & GEOMETRIA", "BEZEL & GEOMETRÍA", "BEZEL & GEOMETRIA");
+        LblMegaBezelThickness.Text = L("GAME SIZE", "TAILLE JEU", "SPIELGRÖSSE", "DIM. GIOCO", "TAMAÑO JUEGO", "TAMANHO JOGO");
         LblFilePath.Text           = L("FILE PATH", "CHEMIN DU FICHIER", "DATEIPFAD", "PERCORSO FILE", "RUTA DEL ARCHIVO", "CAMINHO DO ARQUIVO");
         BtnBezelSearchBtn.Content  = L("Set", "Définir", "Setzen", "Imposta", "Definir", "Definir");
         BtnBezelResetBtn.Content   = L("Reset", "Réinitialiser", "Zurücksetzen", "Ripristina", "Restablecer", "Redefinir");
-        LblBezelOpacity.Text       = L("OPACITY", "OPACITÉ", "DECKKRAFT", "OPACITÀ", "OPACIDAD", "OPACIDADE");
 
         // ── Tab 1: button tooltips ──
         BtnBezelSearchBtn.ToolTip  = L("Choose bezel image file", "Choisir l'image de bezel", "Bezel-Bilddatei wählen", "Scegli file immagine bezel", "Elegir archivo de imagen bezel", "Escolher arquivo de imagem bezel");
@@ -4818,7 +4886,7 @@ private static string FormatHotkeyDisplay(ModifierKeys mods, Key key)
 
         // ── Bezel section tooltip ──
         InfoBezel.ToolTip = BuildCrtTooltip(
-            L("BEZEL",                      "BEZEL",                          "BEZEL",                      "BEZEL",                        "BEZEL",                      "BEZEL"),
+            L("BEZEL & GEOMETRY", "BEZEL & GÉOMÉTRIE", "BEZEL & GEOMETRIE", "BEZEL & GEOMETRIA", "BEZEL & GEOMETRÍA", "BEZEL & GEOMETRIA"),
             L("Bezels are PNG images placed over the screen to frame the game image, like a real arcade or TV cabinet border.\n\n• The image must match your screen resolution (e.g. 1920×1080 for a 1080p monitor).\n• Use a PNG with transparent areas where the game should show through.\n• Set the folder containing your bezel PNGs using the Set button, then use ◀ ▶ to cycle through available bezels.\n• You can also assign a hotkey in the Shortcuts tab to switch bezels without opening S4W.",
               "Les bezels sont des images PNG placées sur l'écran pour encadrer l'image du jeu, comme un vrai cabinet d'arcade ou un bord de télévision.\n\n• L'image doit correspondre à la résolution de votre écran (ex : 1920×1080 pour un moniteur Full HD).\n• Utilisez un PNG avec des zones transparentes là où le jeu doit apparaître.\n• Définissez le dossier contenant vos PNG de bezel via le bouton Set, puis utilisez ◀ ▶ pour parcourir les bezels disponibles.\n• Vous pouvez aussi assigner un raccourci clavier dans l'onglet Raccourcis pour changer de bezel sans ouvrir S4W.",
               "Bezels sind PNG-Bilder, die über den Bildschirm gelegt werden, um das Spielbild zu rahmen, wie ein echtes Arcade-Kabinett oder ein TV-Rahmen.\n\n• Das Bild muss Ihrer Bildschirmauflösung entsprechen (z. B. 1920×1080 für einen Full-HD-Monitor).\n• Verwenden Sie ein PNG mit transparenten Bereichen, wo das Spiel zu sehen sein soll.\n• Legen Sie den Ordner mit Ihren Bezel-PNGs über die Schaltfläche Set fest, dann mit ◀ ▶ durch die verfügbaren Bezels blättern.\n• Sie können auch in den Tastenkürzel-Einstellungen einen Hotkey zuweisen, um Bezels zu wechseln, ohne S4W zu öffnen.",
